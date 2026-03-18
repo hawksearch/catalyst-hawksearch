@@ -1,5 +1,6 @@
 /* eslint-disable complexity */
 import { getTranslations } from 'next-intl/server';
+import { cache } from 'react';
 import { z } from 'zod';
 
 import {
@@ -7,7 +8,157 @@ import {
   PublicSearchParamsSchema,
   PublicToPrivateParams,
 } from '~/app/[locale]/(default)/(faceted)/fetch-faceted-search';
+import { client } from '~/client';
+import { graphql } from '~/client/graphql';
+import { revalidate } from '~/client/revalidate-target';
 import { ExistingResultType } from '~/client/util';
+
+const CategoryTreeQuery = graphql(`
+  query CategoryTreeQuery {
+    site {
+      categoryTree {
+        entityId
+        name
+        path
+        productCount
+        children {
+          entityId
+          name
+          path
+          productCount
+          children {
+            entityId
+            name
+            path
+            productCount
+          }
+        }
+      }
+    }
+  }
+`);
+
+const getCategoryTree = cache(async () => {
+  const response = await client.fetch({
+    document: CategoryTreeQuery,
+    fetchOptions: { next: { revalidate } },
+  });
+
+  return response.data.site.categoryTree;
+});
+
+type CategoryTreeItem = Awaited<ReturnType<typeof getCategoryTree>>[number];
+
+const buildCategoryTreeIndex = (items: CategoryTreeItem[]) => {
+  const index = new Map<number, CategoryTreeItem>();
+
+  const walk = (node: CategoryTreeItem) => {
+    index.set(node.entityId, node);
+
+    node.children?.forEach(walk);
+  };
+
+  items.forEach(walk);
+
+  return index;
+};
+
+const buildCategoryTreeParentIndex = (items: CategoryTreeItem[]) => {
+  const index = new Map<number, number>();
+
+  const walk = (node: CategoryTreeItem, parentId?: number) => {
+    if (parentId != null) {
+      index.set(node.entityId, parentId);
+    }
+
+    node.children?.forEach((child) => walk(child, node.entityId));
+  };
+
+  items.forEach((item) => walk(item));
+
+  return index;
+};
+
+const normalizeCategoryLabel = (value: string) => {
+  const sanitized = value.replace(/%c%[-_]?/gi, '|');
+  let decoded = sanitized;
+
+  try {
+    decoded = decodeURIComponent(sanitized);
+  } catch {
+    decoded = sanitized;
+  }
+
+  const normalized = decoded
+    .replace(/\+/g, ' ')
+    .replace(/&amp;/gi, '&')
+    .replace(/&quot;/gi, '"')
+    .replace(/&#39;/gi, "'")
+    .replace(/&nbsp;/gi, ' ')
+    .replace(/[>/]/g, '|')
+    .replace(/\s+/g, ' ')
+    .trim()
+    .toLowerCase();
+
+  const cleanPart = (part: string) =>
+    part.trim().replace(/^[-_]+/, '').replace(/[-_]+$/, '');
+
+  if (normalized.includes('|')) {
+    return normalized
+      .split('|')
+      .map(cleanPart)
+      .filter(Boolean)
+      .join('|');
+  }
+
+  return cleanPart(normalized);
+};
+
+const buildCategoryTreeNameIndex = (items: CategoryTreeItem[]) => {
+  const index = new Map<string, CategoryTreeItem>();
+
+  const walk = (node: CategoryTreeItem, ancestors: string[]) => {
+    const path = node.path?.replace(/\/+$/, '') ?? '';
+    const slug = path.split('/').filter(Boolean).at(-1) ?? '';
+    const breadcrumb = [...ancestors, node.name].join('|');
+    const keys = [node.name, path, slug, breadcrumb]
+      .map(normalizeCategoryLabel)
+      .filter(Boolean);
+
+    keys.forEach((key) => {
+      if (!index.has(key)) {
+        index.set(key, node);
+      }
+    });
+
+    node.children?.forEach((child) => walk(child, [...ancestors, node.name]));
+  };
+
+  items.forEach((item) => walk(item, []));
+
+  return index;
+};
+
+const hasSelectedDescendant = (
+  node: CategoryTreeItem,
+  selectedCategoryIds: Set<number>,
+): boolean => {
+  if (!node.children || node.children.length === 0) {
+    return false;
+  }
+
+  for (const child of node.children) {
+    if (selectedCategoryIds.has(child.entityId)) {
+      return true;
+    }
+
+    if (hasSelectedDescendant(child, selectedCategoryIds)) {
+      return true;
+    }
+  }
+
+  return false;
+};
 
 export const facetsTransformer = async ({
   refinedFacets,
@@ -20,46 +171,237 @@ export const facetsTransformer = async ({
 }) => {
   const t = await getTranslations('Faceted.FacetedSearch.Facets');
   const { filters } = PublicToPrivateParams.parse(searchParams);
+  const selectedCategoryIds = new Set(filters.categoryEntityIds ?? []);
+  let categoryTree: CategoryTreeItem[] | null = null;
+  let categoryTreeIndex: Map<number, CategoryTreeItem> | null = null;
+  let categoryTreeParentIndex: Map<number, number> | null = null;
+  let categoryTreeNameIndex: Map<string, CategoryTreeItem> | null = null;
+  let refinedCategoryLookup:
+    | Map<number, { productCount: number; subCategoryCounts: Map<number, number> }>
+    | null = null;
+
+  if (selectedCategoryIds.size > 0) {
+    const categoryFacet = allFacets.find(
+      (facet) => facet.__typename === 'CategorySearchFilter',
+    );
+    const needsTree = categoryFacet?.__typename === 'CategorySearchFilter';
+
+    if (needsTree) {
+      const loadedCategoryTree = await getCategoryTree();
+
+      categoryTree = loadedCategoryTree;
+      categoryTreeIndex = buildCategoryTreeIndex(loadedCategoryTree);
+      categoryTreeParentIndex = buildCategoryTreeParentIndex(loadedCategoryTree);
+      categoryTreeNameIndex = buildCategoryTreeNameIndex(loadedCategoryTree);
+    }
+  }
 
   return allFacets.map((facet) => {
     const refinedFacet = refinedFacets.find((f) => f.displayName === facet.displayName);
 
-    if (refinedFacet == null) {
-      return null;
-    }
-
     if (facet.__typename === 'CategorySearchFilter') {
       const refinedCategorySearchFilter =
-        refinedFacet.__typename === 'CategorySearchFilter' ? refinedFacet : null;
+        refinedFacet?.__typename === 'CategorySearchFilter' ? refinedFacet : null;
+      if (refinedCategorySearchFilter && refinedCategoryLookup == null) {
+        refinedCategoryLookup = new Map();
+
+        refinedCategorySearchFilter.categories.forEach((category) => {
+          const subCategoryCounts = new Map<number, number>();
+
+          category.subCategories?.edges?.forEach((edge) => {
+            subCategoryCounts.set(edge.node.entityId, edge.node.productCount);
+          });
+
+          refinedCategoryLookup?.set(category.entityId, {
+            productCount: category.productCount,
+            subCategoryCounts,
+          });
+        });
+      }
+
+      if (categoryTree) {
+        const options = categoryTree.flatMap((category) => {
+          const refinedCategory = refinedCategoryLookup?.get(category.entityId);
+          const isSelected = selectedCategoryIds.has(category.entityId);
+          const disabled = refinedCategory == null && !isSelected;
+          const productCountLabel = disabled
+            ? ''
+            : ` (${refinedCategory?.productCount ?? category.productCount})`;
+          const label = facet.displayProductCount
+            ? `${category.name}${productCountLabel}`
+            : category.name;
+
+          const parentOption = {
+            label,
+            value: category.entityId.toString(),
+            disabled,
+          };
+
+          const children = category.children ?? [];
+          const childIds = children.map((child) => child.entityId);
+          const childSelected = childIds.some((id) => selectedCategoryIds.has(id));
+          const descendantSelected = hasSelectedDescendant(category, selectedCategoryIds);
+          const shouldShowSubCategories =
+            isSelected || childSelected || descendantSelected || refinedCategory != null;
+          const subCategoryOptions = shouldShowSubCategories
+            ? children.map((subCategory) => {
+                const isSubSelected = selectedCategoryIds.has(subCategory.entityId);
+                const refinedCounts = refinedCategoryLookup?.get(category.entityId);
+                const hasRefinedChildData =
+                  refinedCounts?.subCategoryCounts != null &&
+                  refinedCounts.subCategoryCounts.size > 0;
+                const refinedSubCount = hasRefinedChildData
+                  ? refinedCounts?.subCategoryCounts?.get(subCategory.entityId)
+                  : null;
+                const subDisabled = hasRefinedChildData
+                  ? refinedSubCount == null && !isSubSelected
+                  : false;
+                const countSource = refinedSubCount ?? subCategory.productCount;
+                const subProductCountLabel =
+                  facet.displayProductCount && !subDisabled && countSource != null
+                    ? ` (${countSource})`
+                    : '';
+                const subLabel = facet.displayProductCount
+                  ? `  ${subCategory.name}${subProductCountLabel}`
+                  : `  ${subCategory.name}`;
+
+                return {
+                  label: subLabel,
+                  value: subCategory.entityId.toString(),
+                  disabled: subDisabled,
+                };
+              })
+            : [];
+
+          return [parentOption, ...subCategoryOptions];
+        });
+
+        return {
+          type: 'toggle-group' as const,
+          paramName: 'categoryIn',
+          label: facet.displayName,
+          defaultCollapsed: facet.isCollapsedByDefault,
+          options,
+        };
+      }
+
+      // Flatten categories and subcategories into a single options array
+      const options = facet.categories.flatMap((category) => {
+        const refinedCategory = refinedCategorySearchFilter?.categories.find(
+          (c) => c.entityId === category.entityId,
+        );
+        const isSelected = filters.categoryEntityIds?.includes(category.entityId) === true;
+        const disabled = refinedCategory == null && !isSelected;
+        // Use refined count if available, otherwise use original count
+        const productCountLabel = disabled
+          ? ''
+          : ` (${refinedCategory?.productCount ?? category.productCount})`;
+        const label = facet.displayProductCount
+          ? `${category.name}${productCountLabel}`
+          : category.name;
+
+        const parentOption = {
+          label,
+          value: category.entityId.toString(),
+          disabled,
+        };
+
+        // Add subcategories with indentation - show them if parent is selected or if they have refined data
+        const treeNodeById = categoryTreeIndex?.get(category.entityId);
+        let treeNode =
+          treeNodeById ??
+          categoryTreeNameIndex?.get(normalizeCategoryLabel(category.name));
+
+        if (!treeNodeById && treeNode && !treeNode.children?.length) {
+          const parentId = categoryTreeParentIndex?.get(treeNode.entityId);
+          const parentNode = parentId ? categoryTreeIndex?.get(parentId) : undefined;
+
+          if (parentNode) {
+            treeNode = parentNode;
+          }
+        }
+
+        const fallbackChildren = treeNode?.children ?? [];
+        const facetChildren = category.subCategories?.edges ?? [];
+        const useTreeFallback = fallbackChildren.length > 0;
+        const childIds = useTreeFallback
+          ? fallbackChildren.map((child) => child.entityId)
+          : facetChildren.map((edge) => edge.node.entityId);
+        const childSelected = childIds.some((id) => selectedCategoryIds.has(id));
+        const descendantSelected =
+          treeNode != null
+            ? hasSelectedDescendant(treeNode, selectedCategoryIds)
+            : childSelected;
+        const shouldShowSubCategories =
+          isSelected || childSelected || descendantSelected || refinedCategory != null;
+        const subCategoryOptions = shouldShowSubCategories
+          ? useTreeFallback
+            ? fallbackChildren.map((subCategory) => {
+                const isSubSelected =
+                  filters.categoryEntityIds?.includes(subCategory.entityId) === true;
+                const refinedCounts = refinedCategoryLookup?.get(category.entityId);
+                const hasRefinedChildData =
+                  refinedCounts?.subCategoryCounts != null &&
+                  refinedCounts.subCategoryCounts.size > 0;
+                const refinedSubCount = hasRefinedChildData
+                  ? refinedCounts?.subCategoryCounts?.get(subCategory.entityId)
+                  : null;
+                const subDisabled = hasRefinedChildData
+                  ? refinedSubCount == null && !isSubSelected
+                  : false;
+                const countSource = refinedSubCount ?? subCategory.productCount;
+                const subProductCountLabel =
+                  facet.displayProductCount && !subDisabled && countSource != null
+                    ? ` (${countSource})`
+                    : '';
+                const subLabel = facet.displayProductCount
+                  ? `  ${subCategory.name}${subProductCountLabel}`
+                  : `  ${subCategory.name}`;
+
+                return {
+                  label: subLabel,
+                  value: subCategory.entityId.toString(),
+                  disabled: subDisabled,
+                };
+              })
+            : facetChildren.map((edge) => {
+                const subCategory = edge.node;
+                const refinedSubCategory = refinedCategory?.subCategories?.edges?.find(
+                  (e) => e.node.entityId === subCategory.entityId,
+                )?.node;
+                const isSubSelected =
+                  filters.categoryEntityIds?.includes(subCategory.entityId) === true;
+                const subDisabled = refinedSubCategory == null && !isSubSelected;
+                const subProductCountLabel = subDisabled
+                  ? ''
+                  : ` (${refinedSubCategory?.productCount ?? subCategory.productCount})`;
+                const subLabel = facet.displayProductCount
+                  ? `  ${subCategory.name}${subProductCountLabel}`
+                  : `  ${subCategory.name}`;
+
+                return {
+                  label: subLabel,
+                  value: subCategory.entityId.toString(),
+                  disabled: subDisabled,
+                };
+              })
+          : [];
+
+        return [parentOption, ...subCategoryOptions];
+      });
 
       return {
         type: 'toggle-group' as const,
         paramName: 'categoryIn',
         label: facet.displayName,
         defaultCollapsed: facet.isCollapsedByDefault,
-        options: facet.categories.map((category) => {
-          const refinedCategory = refinedCategorySearchFilter?.categories.find(
-            (c) => c.entityId === category.entityId,
-          );
-          const isSelected = filters.categoryEntityIds?.includes(category.entityId) === true;
-          const disabled = refinedCategory == null && !isSelected;
-          const productCountLabel = disabled ? '' : ` (${category.productCount})`;
-          const label = facet.displayProductCount
-            ? `${category.name}${productCountLabel}`
-            : category.name;
-
-          return {
-            label,
-            value: category.entityId.toString(),
-            disabled,
-          };
-        }),
+        options,
       };
     }
 
     if (facet.__typename === 'BrandSearchFilter') {
       const refinedBrandSearchFilter =
-        refinedFacet.__typename === 'BrandSearchFilter' ? refinedFacet : null;
+        refinedFacet?.__typename === 'BrandSearchFilter' ? refinedFacet : null;
 
       return {
         type: 'toggle-group' as const,
@@ -88,7 +430,7 @@ export const facetsTransformer = async ({
 
     if (facet.__typename === 'ProductAttributeSearchFilter') {
       const refinedProductAttributeSearchFilter =
-        refinedFacet.__typename === 'ProductAttributeSearchFilter' ? refinedFacet : null;
+        refinedFacet?.__typename === 'ProductAttributeSearchFilter' ? refinedFacet : null;
 
       return {
         type: 'toggle-group' as const,
@@ -121,7 +463,7 @@ export const facetsTransformer = async ({
 
     if (facet.__typename === 'RatingSearchFilter') {
       const refinedRatingSearchFilter =
-        refinedFacet.__typename === 'RatingSearchFilter' ? refinedFacet : null;
+        refinedFacet?.__typename === 'RatingSearchFilter' ? refinedFacet : null;
       const isSelected = filters.rating?.minRating != null;
 
       return {
@@ -135,7 +477,7 @@ export const facetsTransformer = async ({
 
     if (facet.__typename === 'PriceSearchFilter') {
       const refinedPriceSearchFilter =
-        refinedFacet.__typename === 'PriceSearchFilter' ? refinedFacet : null;
+        refinedFacet?.__typename === 'PriceSearchFilter' ? refinedFacet : null;
       const isSelected = filters.price?.minPrice != null || filters.price?.maxPrice != null;
 
       return {
@@ -152,7 +494,7 @@ export const facetsTransformer = async ({
 
     if (facet.freeShipping) {
       const refinedFreeShippingSearchFilter =
-        refinedFacet.__typename === 'OtherSearchFilter' && refinedFacet.freeShipping
+        refinedFacet?.__typename === 'OtherSearchFilter' && refinedFacet.freeShipping
           ? refinedFacet
           : null;
       const isSelected = filters.isFreeShipping === true;
@@ -174,7 +516,7 @@ export const facetsTransformer = async ({
 
     if (facet.isFeatured) {
       const refinedIsFeaturedSearchFilter =
-        refinedFacet.__typename === 'OtherSearchFilter' && refinedFacet.isFeatured
+        refinedFacet?.__typename === 'OtherSearchFilter' && refinedFacet.isFeatured
           ? refinedFacet
           : null;
       const isSelected = filters.isFeatured === true;
@@ -196,7 +538,7 @@ export const facetsTransformer = async ({
 
     if (facet.isInStock) {
       const refinedIsInStockSearchFilter =
-        refinedFacet.__typename === 'OtherSearchFilter' && refinedFacet.isInStock
+        refinedFacet?.__typename === 'OtherSearchFilter' && refinedFacet.isInStock
           ? refinedFacet
           : null;
       const isSelected = filters.hideOutOfStock === true;

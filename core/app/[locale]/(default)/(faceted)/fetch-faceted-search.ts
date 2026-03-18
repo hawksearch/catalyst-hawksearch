@@ -3,8 +3,10 @@ import { cache } from 'react';
 import { z } from 'zod';
 
 import { client } from '~/client';
+import { facetedHawkSearch } from '~/client/faceted-hawksearch';
 import { PaginationFragment } from '~/client/fragments/pagination';
 import { graphql, VariablesOf } from '~/client/graphql';
+import { hawksearchDebug, isHawksearchEnabled } from '~/client/hawksearch';
 import { CurrencyCode } from '~/components/header/fragment';
 import { ProductCardFragment } from '~/components/product-card/fragment';
 
@@ -166,6 +168,26 @@ const GetProductSearchResultsQuery = graphql(
   [PaginationFragment, ProductCardFragment],
 );
 
+const GetCategoryForHawksearchQuery = graphql(`
+  query GetCategoryForHawksearch($entityId: Int!) {
+    site {
+      category(entityId: $entityId) {
+        entityId
+        name
+        path
+        breadcrumbs(depth: 5) {
+          edges {
+            node {
+              name
+              path
+            }
+          }
+        }
+      }
+    }
+  }
+`);
+
 type Variables = VariablesOf<typeof GetProductSearchResultsQuery>;
 type SearchProductsSortInput = Variables['sort'];
 type SearchProductsFiltersInput = Variables['filters'];
@@ -178,12 +200,88 @@ interface ProductSearch {
   filters: SearchProductsFiltersInput;
 }
 
+const getCategoryFilterValues = cache(async (entityId: number) => {
+  const response = await client.fetch({
+    document: GetCategoryForHawksearchQuery,
+    variables: { entityId },
+    fetchOptions: { next: { revalidate: 300 } },
+  });
+
+  const category = response.data.site.category;
+
+  if (!category) {
+    return [entityId.toString()];
+  }
+
+  const breadcrumbEdges = category.breadcrumbs.edges ?? [];
+  const breadcrumbs = breadcrumbEdges
+    .map((edge) => edge.node.name)
+    .filter((name) => name.trim() !== '');
+
+  const breadcrumbPath = breadcrumbs.length > 0 ? breadcrumbs.join('|') : undefined;
+  const path = category.path.trim();
+  const slug =
+    path !== ''
+      ? path
+          .replace(/^\/+|\/+$/g, '')
+          .split('/')
+          .filter(Boolean)
+          .at(-1)
+      : undefined;
+
+  return [entityId.toString(), category.name, breadcrumbPath, path, slug].filter(
+    (value): value is string => Boolean(value && value.trim() !== ''),
+  );
+});
+
 const getProductSearchResults = cache(
   async (
     { limit = 9, after, before, sort, filters }: ProductSearch,
     currencyCode?: CurrencyCode,
     customerAccessToken?: string,
   ) => {
+    if (isHawksearchEnabled()) {
+      const categoryFilterValues =
+        filters.categoryEntityId != null
+          ? await getCategoryFilterValues(filters.categoryEntityId)
+          : undefined;
+
+      if (categoryFilterValues) {
+        hawksearchDebug('category filter values', {
+          entityId: filters.categoryEntityId,
+          values: categoryFilterValues,
+        });
+      }
+
+      hawksearchDebug('fetch-faceted-search using hawksearch', {
+        limit,
+        after,
+        before,
+        sort,
+        filters,
+        currencyCode,
+      });
+
+      return facetedHawkSearch({
+        limit,
+        after,
+        before,
+        sort: sort ?? undefined,
+        filters,
+        currencyCode,
+        categoryFilterValues,
+      });
+    }
+
+    hawksearchDebug('fetch-faceted-search using storefront api', {
+      limit,
+      after,
+      before,
+      sort,
+      filters,
+      currencyCode,
+    });
+
     const filterArgs = { filters, sort };
     const paginationArgs = before ? { last: limit, before } : { first: limit, after };
 
@@ -252,7 +350,7 @@ const SearchParamToArray = SearchParamSchema.transform((value) => {
   }
 
   if (typeof value === 'string' && value !== '') {
-    return [value];
+    return value.split(',').map((item) => item.trim()).filter(Boolean);
   }
 
   return undefined;
@@ -314,9 +412,13 @@ const PrivateSearchParamsSchema = z.object({
 export const PublicSearchParamsSchema = z.object({
   after: z.string().nullish(),
   before: z.string().nullish(),
-  brand: SearchParamToArray.nullish().transform((value) => value?.map(Number)),
+  brand: SearchParamToArray.nullish().transform((value) =>
+    value?.map(Number).filter((n) => !Number.isNaN(n)),
+  ),
   category: z.coerce.number().optional(),
-  categoryIn: SearchParamToArray.nullish().transform((value) => value?.map(Number)),
+  categoryIn: SearchParamToArray.nullish().transform((value) =>
+    value?.map(Number).filter((n) => !Number.isNaN(n)),
+  ),
   isFeatured: z.coerce.boolean().nullish(),
   limit: z.coerce.number().nullish(),
   minPrice: z.coerce.number().nullish(),
@@ -333,6 +435,8 @@ export const PublicSearchParamsSchema = z.object({
     value?.filter((stock) => z.enum(['free_shipping']).safeParse(stock).success),
   ),
   term: z.string().nullish(),
+  query: z.string().nullish(),
+  q: z.string().nullish(),
 });
 
 const AttributeKey = z.custom<`attr_${string}`>((val) => {
@@ -353,6 +457,8 @@ export const PublicToPrivateParams = PublicSearchParamsSchema.catchall(SearchPar
       minRating,
       maxRating,
       term,
+      query,
+      q,
       shipping,
       stock,
       // There is a bug in Next.js that is adding the path params to the searchParams. We need to filter out the slug params for now.
@@ -369,6 +475,8 @@ export const PublicToPrivateParams = PublicSearchParamsSchema.catchall(SearchPar
         attribute: attribute.replace('attr_', ''),
         values,
       }));
+
+    const resolvedTerm = term ?? query ?? q;
 
     return {
       after,
@@ -397,7 +505,7 @@ export const PublicToPrivateParams = PublicSearchParamsSchema.catchall(SearchPar
                 minRating,
               }
             : undefined,
-        searchTerm: term,
+        searchTerm: resolvedTerm,
       },
     };
   })

@@ -10,6 +10,7 @@ import { SearchResult } from '@/vibes/soul/primitives/navigation';
 import { getSessionCustomerAccessToken } from '~/auth';
 import { client } from '~/client';
 import { graphql } from '~/client/graphql';
+import { hawkSearch, hawksearchDebug, isHawksearchEnabled } from '~/client/hawksearch';
 import { revalidate } from '~/client/revalidate-target';
 import { searchResultsTransformer } from '~/data-transformers/search-results-transformer';
 import { getPreferredCurrencyCode } from '~/lib/currency';
@@ -84,18 +85,30 @@ export async function search(
   const currencyCode = await getPreferredCurrencyCode();
 
   try {
-    const response = await client.fetch({
-      document: GetQuickSearchResultsQuery,
-      variables: { filters: { searchTerm: submission.value.term }, currencyCode },
-      customerAccessToken,
-      fetchOptions: customerAccessToken ? { cache: 'no-store' } : { next: { revalidate } },
+    hawksearchDebug('header quick search', {
+      term: submission.value.term,
+      currencyCode,
+      useHawksearch: isHawksearchEnabled(),
     });
 
-    const { products } = response.data.site.search.searchProducts;
+    const products = isHawksearchEnabled()
+      ? await hawkSearch(submission.value.term, { limit: 5, currencyCode })
+      : removeEdgesAndNodes(
+          (
+            await client.fetch({
+              document: GetQuickSearchResultsQuery,
+              variables: { filters: { searchTerm: submission.value.term }, currencyCode },
+              customerAccessToken,
+              fetchOptions: customerAccessToken ? { cache: 'no-store' } : { next: { revalidate } },
+            })
+          ).data.site.search.searchProducts.products,
+        );
+
+    hawksearchDebug('header quick search results', { count: products.length });
 
     return {
       lastResult: submission.reply(),
-      searchResults: await searchResultsTransformer(removeEdgesAndNodes(products)),
+      searchResults: await searchResultsTransformer(products),
       emptyStateTitle,
       emptyStateSubtitle,
     };

@@ -8,6 +8,7 @@ import { createCompareLoader } from '@/vibes/soul/primitives/compare-drawer/load
 import { ProductsListSection } from '@/vibes/soul/sections/products-list-section';
 import { getFilterParsers } from '@/vibes/soul/sections/products-list-section/filter-parsers';
 import { getSessionCustomerAccessToken } from '~/auth';
+import { hawksearchDebug } from '~/client/hawksearch';
 import { facetsTransformer } from '~/data-transformers/facets-transformer';
 import { pageInfoTransformer } from '~/data-transformers/page-info-transformer';
 import { productCardTransformer } from '~/data-transformers/product-card-transformer';
@@ -21,16 +22,18 @@ import { getSearchPageData } from './page-data';
 
 const compareLoader = createCompareLoader();
 
+const resolveSearchTerm = (searchParams: SearchParams) => {
+  const rawTerm = searchParams.term ?? searchParams.query ?? searchParams.q;
+
+  if (Array.isArray(rawTerm)) {
+    return rawTerm[0] ?? '';
+  }
+
+  return typeof rawTerm === 'string' ? rawTerm : '';
+};
+
 const createSearchSearchParamsLoader = cache(
-  async (searchParams: SearchParams, customerAccessToken?: string) => {
-    const searchTerm = typeof searchParams.term === 'string' ? searchParams.term : '';
-
-    if (!searchTerm) {
-      return null;
-    }
-
-    const search = await fetchFacetedSearch(searchParams, undefined, customerAccessToken);
-    const searchFacets = search.facets.items;
+  async (searchFacets: Awaited<ReturnType<typeof fetchFacetedSearch>>['facets']['items']) => {
     const transformedSearchFacets = await facetsTransformer({
       refinedFacets: searchFacets,
       allFacets: searchFacets,
@@ -87,21 +90,25 @@ export default async function Search(props: Props) {
     const searchParams = await props.searchParams;
     const customerAccessToken = await getSessionCustomerAccessToken();
     const currencyCode = await getPreferredCurrencyCode();
+    const searchTerm = resolveSearchTerm(searchParams);
 
-    const loadSearchParams = await createSearchSearchParamsLoader(
+    hawksearchDebug('search page request', {
       searchParams,
-      customerAccessToken,
-    );
-    const parsedSearchParams = loadSearchParams?.(searchParams) ?? {};
+      searchTerm,
+      currencyCode,
+    });
 
     const search = await fetchFacetedSearch(
-      {
-        ...searchParams,
-        ...parsedSearchParams,
-      },
+      searchParams,
       currencyCode,
       customerAccessToken,
     );
+
+    hawksearchDebug('search page response', {
+      totalItems: search.products.collectionInfo?.totalItems ?? 0,
+      itemCount: search.products.items.length,
+      facetCount: search.facets.items.length,
+    });
 
     return search;
   });
@@ -110,9 +117,11 @@ export default async function Search(props: Props) {
     const format = await getFormatter();
 
     const searchParams = await props.searchParams;
-    const searchTerm = typeof searchParams.term === 'string' ? searchParams.term : '';
+    const searchTerm = resolveSearchTerm(searchParams);
 
     if (!searchTerm) {
+      hawksearchDebug('search page products skipped (no term)', { searchParams });
+
       return [];
     }
 
@@ -132,7 +141,7 @@ export default async function Search(props: Props) {
 
   const streamableTitle = Streamable.from(async () => {
     const searchParams = await props.searchParams;
-    const searchTerm = typeof searchParams.term === 'string' ? searchParams.term : '';
+    const searchTerm = resolveSearchTerm(searchParams);
 
     return `${t('Search.searchResults')} "${searchTerm}"`;
   });
@@ -140,7 +149,7 @@ export default async function Search(props: Props) {
   const streamableTotalCount = Streamable.from(async () => {
     const format = await getFormatter();
     const searchParams = await props.searchParams;
-    const searchTerm = typeof searchParams.term === 'string' ? searchParams.term : '';
+    const searchTerm = resolveSearchTerm(searchParams);
 
     if (!searchTerm) {
       return format.number(0);
@@ -153,16 +162,18 @@ export default async function Search(props: Props) {
 
   const streamableEmptyStateTitle = Streamable.from(async () => {
     const searchParams = await props.searchParams;
-    const searchTerm = typeof searchParams.term === 'string' ? searchParams.term : '';
+    const searchTerm = resolveSearchTerm(searchParams);
 
     return t('Search.Empty.title', { term: searchTerm });
   });
 
   const streamablePagination = Streamable.from(async () => {
     const searchParams = await props.searchParams;
-    const searchTerm = typeof searchParams.term === 'string' ? searchParams.term : '';
+    const searchTerm = resolveSearchTerm(searchParams);
 
     if (!searchTerm) {
+      hawksearchDebug('search page pagination skipped (no term)', { searchParams });
+
       return {
         startCursorParamName: 'before',
         endCursorParamName: 'after',
@@ -178,27 +189,32 @@ export default async function Search(props: Props) {
 
   const streamableFilters = Streamable.from(async () => {
     const searchParams = await props.searchParams;
-    const searchTerm = typeof searchParams.term === 'string' ? searchParams.term : '';
+    const searchTerm = resolveSearchTerm(searchParams);
     const customerAccessToken = await getSessionCustomerAccessToken();
-
-    if (!searchTerm) {
-      return [];
-    }
-
-    const loadSearchParams = await createSearchSearchParamsLoader(
-      searchParams,
-      customerAccessToken,
-    );
-    const parsedSearchParams = loadSearchParams?.(searchParams) ?? {};
-    const categorySearch = await fetchFacetedSearch({}, undefined, customerAccessToken);
     const refinedSearch = await streamableFacetedSearch;
-
-    const allFacets = categorySearch.facets.items.filter(
-      (facet) => facet.__typename !== 'CategorySearchFilter',
-    );
     const refinedFacets = refinedSearch.facets.items.filter(
       (facet) => facet.__typename !== 'CategorySearchFilter',
     );
+
+    if (!searchTerm) {
+      hawksearchDebug('search page filters skipped (no term)', { searchParams });
+
+      return [];
+    }
+
+    const loadSearchParams = await createSearchSearchParamsLoader(refinedSearch.facets.items);
+    const parsedSearchParams = loadSearchParams?.(searchParams) ?? {};
+
+    hawksearchDebug('search page parsed params', {
+      parsedSearchParams,
+    });
+
+    const requiresUnrefinedBaseline = Object.keys(parsedSearchParams).length > 0;
+    const allFacets = requiresUnrefinedBaseline
+      ? (await fetchFacetedSearch({}, undefined, customerAccessToken)).facets.items.filter(
+          (facet) => facet.__typename !== 'CategorySearchFilter',
+        )
+      : refinedFacets;
 
     const transformedFacets = await facetsTransformer({
       refinedFacets,
