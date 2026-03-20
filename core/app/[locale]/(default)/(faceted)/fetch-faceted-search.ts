@@ -4,8 +4,10 @@ import { z } from 'zod';
 
 import { getSessionCustomerAccessToken } from '~/auth';
 import { client } from '~/client';
+import { facetedHawkSearch } from '~/client/faceted-hawksearch';
 import { PaginationFragment } from '~/client/fragments/pagination';
 import { graphql, VariablesOf } from '~/client/graphql';
+import { hawksearchDebug, isHawksearchEnabled } from '~/client/hawksearch';
 import { revalidate } from '~/client/revalidate-target';
 import { ProductCardFragment } from '~/components/product-card/fragment';
 
@@ -153,6 +155,26 @@ const GetProductSearchResultsQuery = graphql(
   [PaginationFragment, ProductCardFragment],
 );
 
+const GetCategoryForHawksearchQuery = graphql(`
+  query GetCategoryForHawksearch($entityId: Int!) {
+    site {
+      category(entityId: $entityId) {
+        entityId
+        name
+        path
+        breadcrumbs(depth: 5) {
+          edges {
+            node {
+              name
+              path
+            }
+          }
+        }
+      }
+    }
+  }
+`);
+
 type Variables = VariablesOf<typeof GetProductSearchResultsQuery>;
 type SearchProductsSortInput = Variables['sort'];
 type SearchProductsFiltersInput = Variables['filters'];
@@ -165,67 +187,154 @@ interface ProductSearch {
   filters: SearchProductsFiltersInput;
 }
 
+const getCategoryFilterValues = cache(async (entityId: number) => {
+  const response = await client.fetch({
+    document: GetCategoryForHawksearchQuery,
+    variables: { entityId },
+    fetchOptions: { next: { revalidate: 300 } },
+  });
+
+  const category = response.data.site.category;
+
+  if (!category) {
+    return [entityId.toString()];
+  }
+
+  const breadcrumbEdges = category.breadcrumbs.edges ?? [];
+  const breadcrumbs = breadcrumbEdges
+    .map((edge) => edge.node.name)
+    .filter((name) => name.trim() !== '');
+
+  const breadcrumbPath = breadcrumbs.length > 0 ? breadcrumbs.join('|') : undefined;
+  const path = category.path.trim();
+  const slug =
+    path !== ''
+      ? path
+          .replace(/^\/+|\/+$/g, '')
+          .split('/')
+          .filter(Boolean)
+          .at(-1)
+      : undefined;
+
+  return [entityId.toString(), category.name, breadcrumbPath, path, slug].filter(
+    (value): value is string => Boolean(value && value.trim() !== ''),
+  );
+});
+
+const getStorefrontProductSearchResults = async (
+  { limit = 9, after, before, sort, filters }: ProductSearch,
+  customerAccessToken?: string,
+) => {
+  hawksearchDebug('fetch-faceted-search using storefront api', {
+    limit,
+    after,
+    before,
+    sort,
+    filters,
+  });
+
+  const filterArgs = { filters, sort };
+  const paginationArgs = before ? { last: limit, before } : { first: limit, after };
+
+  const response = await client.fetch({
+    document: GetProductSearchResultsQuery,
+    variables: { ...filterArgs, ...paginationArgs },
+    customerAccessToken,
+    fetchOptions: customerAccessToken ? { cache: 'no-store' } : { next: { revalidate: 300 } },
+  });
+
+  const { site } = response.data;
+  const searchResults = site.search.searchProducts;
+  const items = removeEdgesAndNodes(searchResults.products).map((product) => ({
+    ...product,
+    fetchOptions: { next: { revalidate } },
+  }));
+
+  return {
+    facets: {
+      items: removeEdgesAndNodes(searchResults.filters).map((node) => {
+        switch (node.__typename) {
+          case 'BrandSearchFilter':
+            return {
+              ...node,
+              brands: removeEdgesAndNodes(node.brands),
+            };
+
+          case 'CategorySearchFilter':
+            return {
+              ...node,
+              categories: removeEdgesAndNodes(node.categories),
+            };
+
+          case 'ProductAttributeSearchFilter':
+            return {
+              ...node,
+              attributes: removeEdgesAndNodes(node.attributes),
+            };
+
+          case 'RatingSearchFilter':
+            return {
+              ...node,
+              ratings: removeEdgesAndNodes(node.ratings),
+            };
+
+          default:
+            return node;
+        }
+      }),
+    },
+    products: {
+      collectionInfo: searchResults.products.collectionInfo,
+      pageInfo: searchResults.products.pageInfo,
+      items,
+    },
+  };
+};
+
 const getProductSearchResults = cache(
   async ({ limit = 9, after, before, sort, filters }: ProductSearch) => {
+    if (isHawksearchEnabled()) {
+      const categoryFilterValues =
+        filters.categoryEntityId != null
+          ? await getCategoryFilterValues(filters.categoryEntityId)
+          : undefined;
+
+      if (categoryFilterValues) {
+        hawksearchDebug('category filter values', {
+          entityId: filters.categoryEntityId,
+          values: categoryFilterValues,
+        });
+      }
+
+      hawksearchDebug('fetch-faceted-search using hawksearch', {
+        limit,
+        after,
+        before,
+        sort,
+        filters,
+      });
+
+      return (await facetedHawkSearch({
+        limit,
+        after,
+        before,
+        sort: sort ?? undefined,
+        filters,
+        categoryFilterValues,
+      })) as Awaited<ReturnType<typeof getStorefrontProductSearchResults>>;
+    }
+
     const customerAccessToken = await getSessionCustomerAccessToken();
-    const filterArgs = { filters, sort };
-    const paginationArgs = before ? { last: limit, before } : { first: limit, after };
-
-    const response = await client.fetch({
-      document: GetProductSearchResultsQuery,
-      variables: { ...filterArgs, ...paginationArgs },
-      customerAccessToken,
-      fetchOptions: customerAccessToken ? { cache: 'no-store' } : { next: { revalidate: 300 } },
-    });
-
-    const { site } = response.data;
-
-    const searchResults = site.search.searchProducts;
-
-    const items = removeEdgesAndNodes(searchResults.products).map((product) => ({
-      ...product,
-      fetchOptions: { next: { revalidate } },
-    }));
-
-    return {
-      facets: {
-        items: removeEdgesAndNodes(searchResults.filters).map((node) => {
-          switch (node.__typename) {
-            case 'BrandSearchFilter':
-              return {
-                ...node,
-                brands: removeEdgesAndNodes(node.brands),
-              };
-
-            case 'CategorySearchFilter':
-              return {
-                ...node,
-                categories: removeEdgesAndNodes(node.categories),
-              };
-
-            case 'ProductAttributeSearchFilter':
-              return {
-                ...node,
-                attributes: removeEdgesAndNodes(node.attributes),
-              };
-
-            case 'RatingSearchFilter':
-              return {
-                ...node,
-                ratings: removeEdgesAndNodes(node.ratings),
-              };
-
-            default:
-              return node;
-          }
-        }),
+    return getStorefrontProductSearchResults(
+      {
+        limit,
+        after,
+        before,
+        sort,
+        filters,
       },
-      products: {
-        collectionInfo: searchResults.products.collectionInfo,
-        pageInfo: searchResults.products.pageInfo,
-        items,
-      },
-    };
+      customerAccessToken ?? undefined,
+    );
   },
 );
 
@@ -237,7 +346,7 @@ const SearchParamToArray = SearchParamSchema.transform((value) => {
   }
 
   if (typeof value === 'string' && value !== '') {
-    return [value];
+    return value.split(',').map((item) => item.trim()).filter(Boolean);
   }
 
   return undefined;
@@ -299,9 +408,13 @@ const PrivateSearchParamsSchema = z.object({
 export const PublicSearchParamsSchema = z.object({
   after: z.string().optional(),
   before: z.string().optional(),
-  brand: SearchParamToArray.transform((value) => value?.map(Number)),
+  brand: SearchParamToArray.transform((value) =>
+    value?.map(Number).filter((n) => !Number.isNaN(n)),
+  ),
   category: z.coerce.number().optional(),
-  categoryIn: SearchParamToArray.transform((value) => value?.map(Number)),
+  categoryIn: SearchParamToArray.transform((value) =>
+    value?.map(Number).filter((n) => !Number.isNaN(n)),
+  ),
   isFeatured: z.coerce.boolean().optional(),
   limit: z.coerce.number().optional(),
   minPrice: z.coerce.number().optional(),
@@ -318,10 +431,12 @@ export const PublicSearchParamsSchema = z.object({
     value?.filter((stock) => z.enum(['free_shipping']).safeParse(stock).success),
   ),
   term: z.string().optional(),
+  query: z.string().optional(),
+  q: z.string().optional(),
 });
 
 const AttributeKey = z.custom<`attr_${string}`>((val) => {
-  return typeof val === 'string' ? /^attr_\w+$/.test(val) : false;
+  return typeof val === 'string' ? /^attr_.+$/.test(val) : false;
 });
 
 const PublicToPrivateParams = PublicSearchParamsSchema.catchall(SearchParamToArray)
@@ -338,6 +453,8 @@ const PublicToPrivateParams = PublicSearchParamsSchema.catchall(SearchParamToArr
       minRating,
       maxRating,
       term,
+      query,
+      q,
       shipping,
       stock,
       // There is a bug in Next.js that is adding the path params to the searchParams. We need to filter out the slug params for now.
@@ -349,10 +466,13 @@ const PublicToPrivateParams = PublicSearchParamsSchema.catchall(SearchParamToArr
     // Assuming the rest of the params are product attributes for now. We need to see if we can get the GQL endpoint to ingore unknown params.
     const productAttributes = Object.entries(additionalParams)
       .filter(([attribute]) => AttributeKey.safeParse(attribute).success)
+      .filter(([, values]) => values != null)
       .map(([attribute, values]) => ({
         attribute: attribute.replace('attr_', ''),
         values,
       }));
+
+    const resolvedTerm = term ?? query ?? q;
 
     return {
       after,
@@ -381,7 +501,7 @@ const PublicToPrivateParams = PublicSearchParamsSchema.catchall(SearchParamToArr
                 minRating,
               }
             : undefined,
-        searchTerm: term,
+        searchTerm: resolvedTerm,
       },
     };
   })

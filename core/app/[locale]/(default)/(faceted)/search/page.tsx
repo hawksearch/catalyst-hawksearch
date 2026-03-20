@@ -25,7 +25,8 @@ export default async function Search(props: Props) {
   const searchParams = await props.searchParams;
   const t = await getTranslations('Search');
 
-  const searchTerm = typeof searchParams.term === 'string' ? searchParams.term : undefined;
+  const rawTerm = searchParams.term ?? searchParams.query ?? searchParams.q;
+  const searchTerm = typeof rawTerm === 'string' ? rawTerm : undefined;
 
   if (!searchTerm) {
     return (
