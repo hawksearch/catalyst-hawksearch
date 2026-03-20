@@ -86,6 +86,13 @@ const getCategoryTree = cache(async () => {
 });
 
 type CategoryTreeItem = Awaited<ReturnType<typeof getCategoryTree>>[number];
+type CategoryNode = {
+  entityId: number;
+  name: string;
+  path: string;
+  productCount: number;
+  children?: CategoryNode[];
+};
 
 const normalizeCategoryValue = (value: string) => {
   const sanitized = value.replace(/%c%[-_]?/gi, '|');
@@ -125,7 +132,7 @@ const normalizeCategoryValue = (value: string) => {
 const buildCategoryValueIndex = (items: CategoryTreeItem[]) => {
   const index = new Map<string, number>();
 
-  const walk = (node: CategoryTreeItem, ancestors: string[]) => {
+  const walk = (node: CategoryNode, ancestors: string[]) => {
     const rawPath = node.path?.trim() ?? '';
     const path = rawPath.replace(/\/+$/, '');
     const slug = path.split('/').filter(Boolean).at(-1) ?? '';
@@ -445,6 +452,7 @@ const mapFacet = (
   if (normalizedName === 'category') {
     return {
       __typename: 'CategorySearchFilter',
+      name: displayName,
       displayName,
       displayProductCount: true,
       isCollapsedByDefault: false,
@@ -460,6 +468,7 @@ const mapFacet = (
   if (normalizedName === 'brand') {
     return {
       __typename: 'BrandSearchFilter',
+      name: displayName,
       displayName,
       displayProductCount: true,
       isCollapsedByDefault: false,
@@ -473,6 +482,7 @@ const mapFacet = (
 
     return {
       __typename: 'PriceSearchFilter',
+      name: displayName,
       displayName,
       isCollapsedByDefault: false,
       selected:
@@ -488,10 +498,11 @@ const mapFacet = (
   if (normalizedName === 'rating') {
     return {
       __typename: 'RatingSearchFilter',
+      name: displayName,
       displayName,
       isCollapsedByDefault: false,
       ratings: values.map((value) => ({
-        value: toNumber(value.Value) ?? 0,
+        value: value.Value ?? value.Label ?? '',
         isSelected: value.Selected ?? false,
         productCount: value.Count ?? 0,
       })),
@@ -500,10 +511,10 @@ const mapFacet = (
 
   return {
     __typename: 'ProductAttributeSearchFilter',
+    name: displayName,
     displayName,
     displayProductCount: true,
     filterName: facet.Name,
-    filterKey: normalizeFilterKey(facet.Name),
     isCollapsedByDefault: false,
     attributes: mapAttributeFacetValues(values, selectionValues),
   };

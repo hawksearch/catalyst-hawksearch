@@ -1,6 +1,5 @@
 import type { ResultOf } from 'gql.tada';
 
-import type { SearchProductFragment } from '~/components/header/_actions/fragment';
 import type { ProductCardFragment } from '~/components/product-card/fragment';
 
 export interface HawksearchConfig {
@@ -382,11 +381,6 @@ const getFirstFieldValue = (document: Record<string, unknown>, keys: string[]) =
   return undefined;
 };
 
-const getStringArray = (document: Record<string, unknown>, keys: string[]) =>
-  normalizeArray(getFirstFieldValue(document, keys))
-    .map((value) => (typeof value === 'string' ? value : value?.toString?.()))
-    .filter((value): value is string => Boolean(value && value.trim() !== ''));
-
 const FIELD_KEYS = {
   id: ['unique_id', 'product_id', 'entity_id', 'id'],
   name: ['name', 'title', 'product_name'],
@@ -396,27 +390,7 @@ const FIELD_KEYS = {
   inventory: ['metric_inventory', 'inventory', 'stock'],
   brand: ['brand', 'manufacturer', 'brand_name'],
   brandPath: ['brand_path', 'brand_url', 'brand_link'],
-  category: ['category', 'categories'],
-  categoryPath: ['category_path', 'category_url', 'category_link'],
   rating: ['rating', 'average_rating'],
-};
-
-const buildCategoryEdges = (document: Record<string, unknown>) => {
-  const rawCategories = getStringArray(document, FIELD_KEYS.category);
-  const rawCategoryPaths = getStringArray(document, FIELD_KEYS.categoryPath);
-
-  return rawCategories.map((category, index) => {
-    const parts = category.split('|').map((value) => value.trim()).filter(Boolean);
-    const name = parts.at(-1) ?? category;
-    const path = rawCategoryPaths[index] ?? '#';
-
-    return {
-      node: {
-        name,
-        path,
-      },
-    };
-  });
 };
 
 const resolveCurrencyCode = (currencyCode?: string) => currencyCode ?? DEFAULT_CURRENCY;
@@ -468,21 +442,18 @@ export const buildProductCard = (
           path: brandPath,
         }
       : null,
+    productOptions: {
+      edges: [],
+    },
     inventory: {
-      hasVariantInventory: false,
       isInStock: inventoryValue > 0,
-      aggregated: {
-        availableForBackorder: false,
-        unlimitedBackorder: false,
-        availableOnHand: inventoryValue > 0 ? 1 : 0,
-      },
+    },
+    availabilityV2: {
+      status: inventoryValue > 0 ? 'Available' : 'Unavailable',
     },
     reviewSummary: {
       numberOfReviews: 0,
       averageRating: rating,
-    },
-    variants: {
-      edges: [],
     },
     prices: {
       price: {
@@ -507,57 +478,4 @@ export const buildProductCard = (
       },
     },
   };
-};
-
-export const buildSearchProduct = (
-  result: HawksearchResult,
-  currencyCode?: string,
-): ResultOf<typeof SearchProductFragment> | null => {
-  const baseProduct = buildProductCard(result, currencyCode);
-
-  if (!baseProduct) {
-    return null;
-  }
-
-  const categoryEdges = buildCategoryEdges(result.Document);
-  const hasCategoryLinks = categoryEdges.some(
-    (edge) => edge.node.path && edge.node.path !== '#',
-  );
-  const brand =
-    baseProduct.brand && baseProduct.brand.path !== '#' ? baseProduct.brand : null;
-
-  return {
-    ...baseProduct,
-    brand,
-    categories: {
-      edges: hasCategoryLinks ? categoryEdges : [],
-    },
-  };
-};
-
-export const hawkSearch = async (
-  term: string,
-  {
-    limit = 5,
-    currencyCode,
-  }: {
-    limit?: number;
-    currencyCode?: string;
-  } = {},
-): Promise<ResultOf<typeof SearchProductFragment>[]> => {
-  hawksearchDebug('quick search', { term, limit, currencyCode });
-
-  const { payload, fallbackPayload } = buildHawksearchPayloads({
-    term,
-    limit,
-  });
-
-  const response = await runHawksearchSearch(payload, fallbackPayload);
-
-  const results = response.Results ?? [];
-  hawksearchDebug('quick search results', { total: results.length });
-
-  return results
-    .map((result) => buildSearchProduct(result, currencyCode))
-    .filter((product): product is ResultOf<typeof SearchProductFragment> => product != null);
 };
