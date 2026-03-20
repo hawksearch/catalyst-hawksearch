@@ -181,6 +181,12 @@ const getFacetKeys = () => {
 };
 
 const normalizeFilterKey = (value: string) => value.trim();
+const normalizeFacetIdentifier = (value: string) =>
+  value
+    .trim()
+    .toLowerCase()
+    .replace(/[^a-z0-9]+/g, '_')
+    .replace(/^_+|_+$/g, '');
 
 const toNumber = (value?: string) => {
   if (!value) {
@@ -441,14 +447,27 @@ const mapFacet = (
   categoryValueIndex: Map<string, number> | null,
 ) => {
   const displayName = normalizeFacetDisplayName(facet);
-  const normalizedName = facet.Name.trim().toLowerCase();
+  const normalizedName = normalizeFacetIdentifier(facet.Name);
+  const normalizedDisplayName = normalizeFacetIdentifier(displayName);
   const normalizedKey = normalizeFilterKey(facet.Name);
   const values = toFacetValues(facet);
   const selectionValues =
     selections[facet.Name] ?? selections[normalizedKey] ?? selections[normalizedName];
   const facetKeys = getFacetKeys();
+  const normalizedCategoryFacetKey = normalizeFacetIdentifier(facetKeys.category);
+  const normalizedBrandFacetKey = normalizeFacetIdentifier(facetKeys.brand);
+  const normalizedPriceFacetKey = normalizeFacetIdentifier(facetKeys.price);
+  const normalizedRatingFacetKey = normalizeFacetIdentifier('rating');
+  const hasRangeValues = values.some(
+    (value) => value.RangeStart != null || value.RangeEnd != null,
+  );
 
-  if (normalizedName === 'category') {
+  const isCategoryFacet =
+    normalizedName === normalizedCategoryFacetKey ||
+    normalizedDisplayName === normalizedCategoryFacetKey ||
+    normalizedName === 'category';
+
+  if (isCategoryFacet) {
     return {
       __typename: 'CategorySearchFilter',
       displayName,
@@ -463,7 +482,12 @@ const mapFacet = (
     };
   }
 
-  if (normalizedName === 'brand') {
+  const isBrandFacet =
+    normalizedName === normalizedBrandFacetKey ||
+    normalizedDisplayName === normalizedBrandFacetKey ||
+    normalizedName === 'brand';
+
+  if (isBrandFacet) {
     return {
       __typename: 'BrandSearchFilter',
       displayName,
@@ -473,9 +497,25 @@ const mapFacet = (
     };
   }
 
-  if (normalizedName === 'price' || normalizedName === 'price_retail') {
-    const selectedMin = filters.price?.minPrice ?? toNumber(values[0]?.RangeStart);
-    const selectedMax = filters.price?.maxPrice ?? toNumber(values[0]?.RangeEnd);
+  const isPriceFacet =
+    normalizedName === normalizedPriceFacetKey ||
+    normalizedDisplayName === normalizedPriceFacetKey ||
+    normalizedName === 'price' ||
+    normalizedName === 'price_retail' ||
+    normalizedName === 'price_sale' ||
+    (normalizedName.startsWith('price') && hasRangeValues);
+
+  if (isPriceFacet) {
+    const rangeStarts = values
+      .map((value) => toNumber(value.RangeStart))
+      .filter((value): value is number => value != null);
+    const rangeEnds = values
+      .map((value) => toNumber(value.RangeEnd))
+      .filter((value): value is number => value != null);
+    const facetMin = rangeStarts.length > 0 ? Math.min(...rangeStarts) : undefined;
+    const facetMax = rangeEnds.length > 0 ? Math.max(...rangeEnds) : undefined;
+    const selectedMin = filters.price?.minPrice ?? facetMin;
+    const selectedMax = filters.price?.maxPrice ?? facetMax;
 
     return {
       __typename: 'PriceSearchFilter',
@@ -491,7 +531,11 @@ const mapFacet = (
     };
   }
 
-  if (normalizedName === 'rating') {
+  const isRatingFacet =
+    normalizedName === normalizedRatingFacetKey ||
+    normalizedDisplayName === normalizedRatingFacetKey;
+
+  if (isRatingFacet) {
     return {
       __typename: 'RatingSearchFilter',
       displayName,
@@ -572,16 +616,18 @@ export const facetedHawkSearch = async ({
 
       // Process facets to populate the map
       initialResponse.Facets?.forEach((facet) => {
-        const facetName = facet.Name.trim().toLowerCase();
+        const facetName = normalizeFacetIdentifier(facet.Name);
+        const normalizedCategoryFacetKey = normalizeFacetIdentifier(facetKeys.category);
+        const normalizedBrandFacetKey = normalizeFacetIdentifier(facetKeys.brand);
 
-        if (facetName === 'category') {
+        if (facetName === normalizedCategoryFacetKey || facetName === 'category') {
           mapCategoryFacetValues(
             facet.Values ?? [],
             undefined,
             facetKeys.category,
             categoryValueIndex,
           );
-        } else if (facetName === 'brand') {
+        } else if (facetName === normalizedBrandFacetKey || facetName === 'brand') {
           mapBrandFacetValues(facet.Values ?? [], undefined, facetKeys.brand);
         }
       });

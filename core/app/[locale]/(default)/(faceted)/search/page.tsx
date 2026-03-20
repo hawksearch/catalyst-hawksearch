@@ -192,9 +192,7 @@ export default async function Search(props: Props) {
     const searchTerm = resolveSearchTerm(searchParams);
     const customerAccessToken = await getSessionCustomerAccessToken();
     const refinedSearch = await streamableFacetedSearch;
-    const refinedFacets = refinedSearch.facets.items.filter(
-      (facet) => facet.__typename !== 'CategorySearchFilter',
-    );
+    const refinedFacets = refinedSearch.facets.items;
 
     if (!searchTerm) {
       hawksearchDebug('search page filters skipped (no term)', { searchParams });
@@ -212,9 +210,8 @@ export default async function Search(props: Props) {
     const requiresUnrefinedBaseline = Object.keys(parsedSearchParams).length > 0;
     const baselineSearchParams = { term: searchTerm };
     const allFacets = requiresUnrefinedBaseline
-      ? (
-          await fetchFacetedSearch(baselineSearchParams, undefined, customerAccessToken)
-        ).facets.items.filter((facet) => facet.__typename !== 'CategorySearchFilter')
+      ? (await fetchFacetedSearch(baselineSearchParams, undefined, customerAccessToken))
+          .facets.items
       : refinedFacets;
 
     const transformedFacets = await facetsTransformer({

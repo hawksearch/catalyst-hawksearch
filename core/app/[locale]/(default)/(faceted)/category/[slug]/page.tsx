@@ -35,9 +35,7 @@ const createCategorySearchParamsLoader = cache(
   async (categoryId: number, customerAccessToken?: string) => {
     const cachedCategory = getCachedCategory(categoryId);
     const categorySearch = await fetchFacetedSearch(cachedCategory, undefined, customerAccessToken);
-    const categoryFacets = categorySearch.facets.items.filter(
-      (facet) => facet.__typename !== 'CategorySearchFilter',
-    );
+    const categoryFacets = categorySearch.facets.items;
     const transformedCategoryFacets = await facetsTransformer({
       refinedFacets: categoryFacets,
       allFacets: categoryFacets,
@@ -190,12 +188,8 @@ export default async function Category(props: Props) {
     const categorySearch = await fetchFacetedSearch(cachedCategory, undefined, customerAccessToken);
     const refinedSearch = await streamableFacetedSearch;
 
-    const allFacets = categorySearch.facets.items.filter(
-      (facet) => facet.__typename !== 'CategorySearchFilter',
-    );
-    const refinedFacets = refinedSearch.facets.items.filter(
-      (facet) => facet.__typename !== 'CategorySearchFilter',
-    );
+    const allFacets = categorySearch.facets.items;
+    const refinedFacets = refinedSearch.facets.items;
 
     const transformedFacets = await facetsTransformer({
       refinedFacets,
