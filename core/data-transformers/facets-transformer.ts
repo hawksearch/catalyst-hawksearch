@@ -48,11 +48,18 @@ const getCategoryTree = cache(async () => {
 });
 
 type CategoryTreeItem = Awaited<ReturnType<typeof getCategoryTree>>[number];
+type CategoryTreeNode = {
+  entityId: number;
+  name: string;
+  path: string;
+  productCount: number;
+  children?: CategoryTreeNode[] | null;
+};
 
-const buildCategoryTreeIndex = (items: CategoryTreeItem[]) => {
-  const index = new Map<number, CategoryTreeItem>();
+const buildCategoryTreeIndex = (items: CategoryTreeNode[]) => {
+  const index = new Map<number, CategoryTreeNode>();
 
-  const walk = (node: CategoryTreeItem) => {
+  const walk = (node: CategoryTreeNode) => {
     index.set(node.entityId, node);
 
     node.children?.forEach(walk);
@@ -63,10 +70,10 @@ const buildCategoryTreeIndex = (items: CategoryTreeItem[]) => {
   return index;
 };
 
-const buildCategoryTreeParentIndex = (items: CategoryTreeItem[]) => {
+const buildCategoryTreeParentIndex = (items: CategoryTreeNode[]) => {
   const index = new Map<number, number>();
 
-  const walk = (node: CategoryTreeItem, parentId?: number) => {
+  const walk = (node: CategoryTreeNode, parentId?: number) => {
     if (parentId != null) {
       index.set(node.entityId, parentId);
     }
@@ -114,10 +121,10 @@ const normalizeCategoryLabel = (value: string) => {
   return cleanPart(normalized);
 };
 
-const buildCategoryTreeNameIndex = (items: CategoryTreeItem[]) => {
-  const index = new Map<string, CategoryTreeItem>();
+const buildCategoryTreeNameIndex = (items: CategoryTreeNode[]) => {
+  const index = new Map<string, CategoryTreeNode>();
 
-  const walk = (node: CategoryTreeItem, ancestors: string[]) => {
+  const walk = (node: CategoryTreeNode, ancestors: string[]) => {
     const path = node.path?.replace(/\/+$/, '') ?? '';
     const slug = path.split('/').filter(Boolean).at(-1) ?? '';
     const breadcrumb = [...ancestors, node.name].join('|');
@@ -140,7 +147,7 @@ const buildCategoryTreeNameIndex = (items: CategoryTreeItem[]) => {
 };
 
 const hasSelectedDescendant = (
-  node: CategoryTreeItem,
+  node: CategoryTreeNode,
   selectedCategoryIds: Set<number>,
 ): boolean => {
   if (!node.children || node.children.length === 0) {
@@ -165,17 +172,17 @@ export const facetsTransformer = async ({
   allFacets,
   searchParams,
 }: {
-  refinedFacets: ExistingResultType<typeof fetchFacetedSearch>['facets']['items'];
-  allFacets: ExistingResultType<typeof fetchFacetedSearch>['facets']['items'];
+  refinedFacets: ExistingResultType<typeof fetchFacetedSearch>['facets']['items'][number][];
+  allFacets: ExistingResultType<typeof fetchFacetedSearch>['facets']['items'][number][];
   searchParams: z.input<typeof PublicSearchParamsSchema>;
 }) => {
   const t = await getTranslations('Faceted.FacetedSearch.Facets');
   const { filters } = PublicToPrivateParams.parse(searchParams);
   const selectedCategoryIds = new Set(filters.categoryEntityIds ?? []);
-  let categoryTree: CategoryTreeItem[] | null = null;
-  let categoryTreeIndex: Map<number, CategoryTreeItem> | null = null;
+  let categoryTree: CategoryTreeNode[] | null = null;
+  let categoryTreeIndex: Map<number, CategoryTreeNode> | null = null;
   let categoryTreeParentIndex: Map<number, number> | null = null;
-  let categoryTreeNameIndex: Map<string, CategoryTreeItem> | null = null;
+  let categoryTreeNameIndex: Map<string, CategoryTreeNode> | null = null;
   let refinedCategoryLookup:
     | Map<number, { productCount: number; subCategoryCounts: Map<number, number> }>
     | null = null;
@@ -205,7 +212,7 @@ export const facetsTransformer = async ({
       if (refinedCategorySearchFilter && refinedCategoryLookup == null) {
         refinedCategoryLookup = new Map();
 
-        refinedCategorySearchFilter.categories.forEach((category) => {
+        refinedCategorySearchFilter.categories?.forEach((category) => {
           const subCategoryCounts = new Map<number, number>();
 
           category.subCategories?.edges?.forEach((edge) => {
@@ -286,8 +293,8 @@ export const facetsTransformer = async ({
       }
 
       // Flatten categories and subcategories into a single options array
-      const options = facet.categories.flatMap((category) => {
-        const refinedCategory = refinedCategorySearchFilter?.categories.find(
+      const options = (facet.categories ?? []).flatMap((category) => {
+        const refinedCategory = refinedCategorySearchFilter?.categories?.find(
           (c) => c.entityId === category.entityId,
         );
         const isSelected = filters.categoryEntityIds?.includes(category.entityId) === true;
@@ -408,8 +415,8 @@ export const facetsTransformer = async ({
         paramName: 'brand',
         label: facet.displayName,
         defaultCollapsed: facet.isCollapsedByDefault,
-        options: facet.brands.map((brand) => {
-          const refinedBrand = refinedBrandSearchFilter?.brands.find(
+        options: (facet.brands ?? []).map((brand) => {
+          const refinedBrand = refinedBrandSearchFilter?.brands?.find(
             (b) => b.entityId === brand.entityId,
           );
           const isSelected = filters.brandEntityIds?.includes(brand.entityId) === true;
@@ -437,8 +444,8 @@ export const facetsTransformer = async ({
         paramName: `attr_${facet.filterKey}`,
         label: facet.displayName,
         defaultCollapsed: facet.isCollapsedByDefault,
-        options: facet.attributes.map((attribute) => {
-          const refinedAttribute = refinedProductAttributeSearchFilter?.attributes.find(
+        options: (facet.attributes ?? []).map((attribute) => {
+          const refinedAttribute = refinedProductAttributeSearchFilter?.attributes?.find(
             (a) => a.value === attribute.value,
           );
 
@@ -492,9 +499,9 @@ export const facetsTransformer = async ({
       };
     }
 
-    if (facet.freeShipping) {
+    if ('freeShipping' in facet && facet.freeShipping) {
       const refinedFreeShippingSearchFilter =
-        refinedFacet?.__typename === 'OtherSearchFilter' && refinedFacet.freeShipping
+        refinedFacet && 'freeShipping' in refinedFacet && refinedFacet.freeShipping
           ? refinedFacet
           : null;
       const isSelected = filters.isFreeShipping === true;
@@ -514,9 +521,9 @@ export const facetsTransformer = async ({
       };
     }
 
-    if (facet.isFeatured) {
+    if ('isFeatured' in facet && facet.isFeatured) {
       const refinedIsFeaturedSearchFilter =
-        refinedFacet?.__typename === 'OtherSearchFilter' && refinedFacet.isFeatured
+        refinedFacet && 'isFeatured' in refinedFacet && refinedFacet.isFeatured
           ? refinedFacet
           : null;
       const isSelected = filters.isFeatured === true;
@@ -536,9 +543,9 @@ export const facetsTransformer = async ({
       };
     }
 
-    if (facet.isInStock) {
+    if ('isInStock' in facet && facet.isInStock) {
       const refinedIsInStockSearchFilter =
-        refinedFacet?.__typename === 'OtherSearchFilter' && refinedFacet.isInStock
+        refinedFacet && 'isInStock' in refinedFacet && refinedFacet.isInStock
           ? refinedFacet
           : null;
       const isSelected = filters.hideOutOfStock === true;

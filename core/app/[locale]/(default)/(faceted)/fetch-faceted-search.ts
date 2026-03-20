@@ -2,13 +2,12 @@ import { removeEdgesAndNodes } from '@bigcommerce/catalyst-client';
 import { cache } from 'react';
 import { z } from 'zod';
 
-import { getSessionCustomerAccessToken } from '~/auth';
 import { client } from '~/client';
 import { facetedHawkSearch } from '~/client/faceted-hawksearch';
 import { PaginationFragment } from '~/client/fragments/pagination';
 import { graphql, VariablesOf } from '~/client/graphql';
 import { hawksearchDebug, isHawksearchEnabled } from '~/client/hawksearch';
-import { revalidate } from '~/client/revalidate-target';
+import { CurrencyCode } from '~/components/header/fragment';
 import { ProductCardFragment } from '~/components/product-card/fragment';
 
 const GetProductSearchResultsQuery = graphql(
@@ -20,6 +19,7 @@ const GetProductSearchResultsQuery = graphql(
       $before: String
       $filters: SearchProductsFiltersInput!
       $sort: SearchProductsSortInput
+      $currencyCode: currencyCode
     ) {
       site {
         search {
@@ -41,10 +41,11 @@ const GetProductSearchResultsQuery = graphql(
               edges {
                 node {
                   __typename
-                  name
+                  displayName
                   isCollapsedByDefault
                   ... on BrandSearchFilter {
                     displayProductCount
+                    displayName
                     brands {
                       pageInfo {
                         ...PaginationFragment
@@ -62,6 +63,7 @@ const GetProductSearchResultsQuery = graphql(
                   }
                   ... on CategorySearchFilter {
                     displayProductCount
+                    displayName
                     categories {
                       pageInfo {
                         ...PaginationFragment
@@ -94,6 +96,8 @@ const GetProductSearchResultsQuery = graphql(
                   ... on ProductAttributeSearchFilter {
                     displayProductCount
                     filterName
+                    filterKey
+                    displayName
                     attributes {
                       pageInfo {
                         ...PaginationFragment
@@ -109,6 +113,7 @@ const GetProductSearchResultsQuery = graphql(
                     }
                   }
                   ... on RatingSearchFilter {
+                    displayName
                     ratings {
                       pageInfo {
                         ...PaginationFragment
@@ -124,6 +129,7 @@ const GetProductSearchResultsQuery = graphql(
                     }
                   }
                   ... on PriceSearchFilter {
+                    displayName
                     selected {
                       minPrice
                       maxPrice
@@ -146,6 +152,13 @@ const GetProductSearchResultsQuery = graphql(
                   }
                 }
               }
+            }
+          }
+        }
+        settings {
+          storefront {
+            catalog {
+              productComparisonsEnabled
             }
           }
         }
@@ -180,10 +193,10 @@ type SearchProductsSortInput = Variables['sort'];
 type SearchProductsFiltersInput = Variables['filters'];
 
 interface ProductSearch {
-  limit?: number;
-  before?: string;
-  after?: string;
-  sort?: SearchProductsSortInput;
+  limit?: number | null;
+  before?: string | null;
+  after?: string | null;
+  sort?: SearchProductsSortInput | null;
   filters: SearchProductsFiltersInput;
 }
 
@@ -221,78 +234,12 @@ const getCategoryFilterValues = cache(async (entityId: number) => {
   );
 });
 
-const getStorefrontProductSearchResults = async (
-  { limit = 9, after, before, sort, filters }: ProductSearch,
-  customerAccessToken?: string,
-) => {
-  hawksearchDebug('fetch-faceted-search using storefront api', {
-    limit,
-    after,
-    before,
-    sort,
-    filters,
-  });
-
-  const filterArgs = { filters, sort };
-  const paginationArgs = before ? { last: limit, before } : { first: limit, after };
-
-  const response = await client.fetch({
-    document: GetProductSearchResultsQuery,
-    variables: { ...filterArgs, ...paginationArgs },
-    customerAccessToken,
-    fetchOptions: customerAccessToken ? { cache: 'no-store' } : { next: { revalidate: 300 } },
-  });
-
-  const { site } = response.data;
-  const searchResults = site.search.searchProducts;
-  const items = removeEdgesAndNodes(searchResults.products).map((product) => ({
-    ...product,
-    fetchOptions: { next: { revalidate } },
-  }));
-
-  return {
-    facets: {
-      items: removeEdgesAndNodes(searchResults.filters).map((node) => {
-        switch (node.__typename) {
-          case 'BrandSearchFilter':
-            return {
-              ...node,
-              brands: removeEdgesAndNodes(node.brands),
-            };
-
-          case 'CategorySearchFilter':
-            return {
-              ...node,
-              categories: removeEdgesAndNodes(node.categories),
-            };
-
-          case 'ProductAttributeSearchFilter':
-            return {
-              ...node,
-              attributes: removeEdgesAndNodes(node.attributes),
-            };
-
-          case 'RatingSearchFilter':
-            return {
-              ...node,
-              ratings: removeEdgesAndNodes(node.ratings),
-            };
-
-          default:
-            return node;
-        }
-      }),
-    },
-    products: {
-      collectionInfo: searchResults.products.collectionInfo,
-      pageInfo: searchResults.products.pageInfo,
-      items,
-    },
-  };
-};
-
 const getProductSearchResults = cache(
-  async ({ limit = 9, after, before, sort, filters }: ProductSearch) => {
+  async (
+    { limit = 9, after, before, sort, filters }: ProductSearch,
+    currencyCode?: CurrencyCode,
+    customerAccessToken?: string,
+  ) => {
     if (isHawksearchEnabled()) {
       const categoryFilterValues =
         filters.categoryEntityId != null
@@ -312,29 +259,86 @@ const getProductSearchResults = cache(
         before,
         sort,
         filters,
+        currencyCode,
       });
 
-      return (await facetedHawkSearch({
+      return facetedHawkSearch({
         limit,
         after,
         before,
         sort: sort ?? undefined,
         filters,
+        currencyCode,
         categoryFilterValues,
-      })) as Awaited<ReturnType<typeof getStorefrontProductSearchResults>>;
+      });
     }
 
-    const customerAccessToken = await getSessionCustomerAccessToken();
-    return getStorefrontProductSearchResults(
-      {
-        limit,
-        after,
-        before,
-        sort,
-        filters,
+    hawksearchDebug('fetch-faceted-search using storefront api', {
+      limit,
+      after,
+      before,
+      sort,
+      filters,
+      currencyCode,
+    });
+
+    const filterArgs = { filters, sort };
+    const paginationArgs = before ? { last: limit, before } : { first: limit, after };
+
+    const response = await client.fetch({
+      document: GetProductSearchResultsQuery,
+      variables: { ...filterArgs, ...paginationArgs, currencyCode },
+      customerAccessToken,
+      fetchOptions: customerAccessToken ? { cache: 'no-store' } : { next: { revalidate: 300 } },
+    });
+
+    const { site } = response.data;
+
+    const searchResults = site.search.searchProducts;
+
+    const items = removeEdgesAndNodes(searchResults.products).map((product) => ({
+      ...product,
+    }));
+
+    return {
+      facets: {
+        items: removeEdgesAndNodes(searchResults.filters).map((node) => {
+          switch (node.__typename) {
+            case 'BrandSearchFilter':
+              return {
+                ...node,
+                brands: removeEdgesAndNodes(node.brands),
+              };
+
+            case 'CategorySearchFilter':
+              return {
+                ...node,
+                categories: removeEdgesAndNodes(node.categories),
+              };
+
+            case 'ProductAttributeSearchFilter':
+              return {
+                ...node,
+                attributes: removeEdgesAndNodes(node.attributes),
+              };
+
+            case 'RatingSearchFilter':
+              return {
+                ...node,
+                ratings: removeEdgesAndNodes(node.ratings),
+              };
+
+            default:
+              return node;
+          }
+        }),
       },
-      customerAccessToken ?? undefined,
-    );
+      products: {
+        collectionInfo: searchResults.products.collectionInfo,
+        pageInfo: searchResults.products.pageInfo,
+        items,
+      },
+    };
   },
 );
 
@@ -367,18 +371,18 @@ const PrivateSortParam = z.union([
 const PublicSortParam = z.string().toUpperCase().pipe(PrivateSortParam);
 
 const SearchProductsFiltersInputSchema = z.object({
-  brandEntityIds: z.array(z.number()).optional(),
-  categoryEntityId: z.number().optional(),
-  categoryEntityIds: z.array(z.number()).optional(),
-  hideOutOfStock: z.boolean().optional(),
-  isFeatured: z.boolean().optional(),
-  isFreeShipping: z.boolean().optional(),
+  brandEntityIds: z.array(z.number()).nullish(),
+  categoryEntityId: z.number().nullish(),
+  categoryEntityIds: z.array(z.number()).nullish(),
+  hideOutOfStock: z.boolean().nullish(),
+  isFeatured: z.boolean().nullish(),
+  isFreeShipping: z.boolean().nullish(),
   price: z
     .object({
-      maxPrice: z.number().optional(),
-      minPrice: z.number().optional(),
+      maxPrice: z.number().nullish(),
+      minPrice: z.number().nullish(),
     })
-    .optional(),
+    .nullish(),
   productAttributes: z
     .array(
       z.object({
@@ -386,60 +390,60 @@ const SearchProductsFiltersInputSchema = z.object({
         values: z.array(z.string()),
       }),
     )
-    .optional(),
+    .nullish(),
   rating: z
     .object({
-      maxRating: z.number().optional(),
-      minRating: z.number().optional(),
+      maxRating: z.number().nullish(),
+      minRating: z.number().nullish(),
     })
-    .optional(),
-  searchSubCategories: z.boolean().optional(),
-  searchTerm: z.string().optional(),
+    .nullish(),
+  searchSubCategories: z.boolean().nullish(),
+  searchTerm: z.string().nullish(),
 }) satisfies z.ZodType<SearchProductsFiltersInput>;
 
 const PrivateSearchParamsSchema = z.object({
-  after: z.string().optional(),
-  before: z.string().optional(),
-  limit: z.number().optional(),
-  sort: PrivateSortParam.optional(),
+  after: z.string().nullish(),
+  before: z.string().nullish(),
+  limit: z.number().nullish(),
+  sort: PrivateSortParam.nullish(),
   filters: SearchProductsFiltersInputSchema,
 });
 
 export const PublicSearchParamsSchema = z.object({
-  after: z.string().optional(),
-  before: z.string().optional(),
-  brand: SearchParamToArray.transform((value) =>
+  after: z.string().nullish(),
+  before: z.string().nullish(),
+  brand: SearchParamToArray.nullish().transform((value) =>
     value?.map(Number).filter((n) => !Number.isNaN(n)),
   ),
   category: z.coerce.number().optional(),
-  categoryIn: SearchParamToArray.transform((value) =>
+  categoryIn: SearchParamToArray.nullish().transform((value) =>
     value?.map(Number).filter((n) => !Number.isNaN(n)),
   ),
-  isFeatured: z.coerce.boolean().optional(),
-  limit: z.coerce.number().optional(),
-  minPrice: z.coerce.number().optional(),
-  maxPrice: z.coerce.number().optional(),
-  minRating: z.coerce.number().optional(),
-  maxRating: z.coerce.number().optional(),
-  sort: PublicSortParam.optional(),
+  isFeatured: z.coerce.boolean().nullish(),
+  limit: z.coerce.number().nullish(),
+  minPrice: z.coerce.number().nullish(),
+  maxPrice: z.coerce.number().nullish(),
+  minRating: z.coerce.number().nullish(),
+  maxRating: z.coerce.number().nullish(),
+  sort: PublicSortParam.nullish(),
   // In the future we should support more stock filters, e.g. out of stock, low stock, etc.
-  stock: SearchParamToArray.transform((value) =>
+  stock: SearchParamToArray.nullish().transform((value) =>
     value?.filter((stock) => z.enum(['in_stock']).safeParse(stock).success),
   ),
   // In the future we should support more shipping filters, e.g. 2 day shipping, same day, etc.
-  shipping: SearchParamToArray.transform((value) =>
+  shipping: SearchParamToArray.nullish().transform((value) =>
     value?.filter((stock) => z.enum(['free_shipping']).safeParse(stock).success),
   ),
-  term: z.string().optional(),
-  query: z.string().optional(),
-  q: z.string().optional(),
+  term: z.string().nullish(),
+  query: z.string().nullish(),
+  q: z.string().nullish(),
 });
 
 const AttributeKey = z.custom<`attr_${string}`>((val) => {
   return typeof val === 'string' ? /^attr_.+$/.test(val) : false;
 });
 
-const PublicToPrivateParams = PublicSearchParamsSchema.catchall(SearchParamToArray)
+export const PublicToPrivateParams = PublicSearchParamsSchema.catchall(SearchParamToArray.nullish())
   .transform((publicParams) => {
     const { after, before, limit, sort, ...filters } = publicParams;
 
@@ -509,15 +513,23 @@ const PublicToPrivateParams = PublicSearchParamsSchema.catchall(SearchParamToArr
 
 export const fetchFacetedSearch = cache(
   // We need to make sure the reference passed into this function is the same if we want it to be memoized.
-  async (params: z.input<typeof PublicSearchParamsSchema>) => {
+  async (
+    params: z.input<typeof PublicSearchParamsSchema>,
+    currencyCode?: CurrencyCode,
+    customerAccessToken?: string,
+  ) => {
     const { after, before, limit = 9, sort, filters } = PublicToPrivateParams.parse(params);
 
-    return getProductSearchResults({
-      after,
-      before,
-      limit,
-      sort,
-      filters,
-    });
+    return getProductSearchResults(
+      {
+        after,
+        before,
+        limit,
+        sort,
+        filters,
+      },
+      currencyCode,
+      customerAccessToken,
+    );
   },
 );

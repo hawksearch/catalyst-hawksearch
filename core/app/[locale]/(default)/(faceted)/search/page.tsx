@@ -1,116 +1,292 @@
-import { getTranslations } from 'next-intl/server';
+import { Metadata } from 'next';
+import { getFormatter, getTranslations, setRequestLocale } from 'next-intl/server';
+import { createLoader, SearchParams } from 'nuqs/server';
+import { cache } from 'react';
 
-import { ProductCard } from '~/components/product-card';
-import { SearchForm } from '~/components/search-form';
-import { Pagination } from '~/components/ui/pagination';
+import { Streamable } from '@/vibes/soul/lib/streamable';
+import { createCompareLoader } from '@/vibes/soul/primitives/compare-drawer/loader';
+import { ProductsListSection } from '@/vibes/soul/sections/products-list-section';
+import { getFilterParsers } from '@/vibes/soul/sections/products-list-section/filter-parsers';
+import { getSessionCustomerAccessToken } from '~/auth';
+import { hawksearchDebug } from '~/client/hawksearch';
+import { facetsTransformer } from '~/data-transformers/facets-transformer';
+import { pageInfoTransformer } from '~/data-transformers/page-info-transformer';
+import { productCardTransformer } from '~/data-transformers/product-card-transformer';
+import { getPreferredCurrencyCode } from '~/lib/currency';
 
-import { FacetedSearch } from '../_components/faceted-search';
-import { MobileSideNav } from '../_components/mobile-side-nav';
-import { SortBy } from '../_components/sort-by';
+import { MAX_COMPARE_LIMIT } from '../../compare/page-data';
+import { getCompareProducts as getCompareProductsData } from '../fetch-compare-products';
 import { fetchFacetedSearch } from '../fetch-faceted-search';
 
-export async function generateMetadata() {
-  const t = await getTranslations('Search');
+import { getSearchPageData } from './page-data';
+
+const compareLoader = createCompareLoader();
+
+const resolveSearchTerm = (searchParams: SearchParams) => {
+  const rawTerm = searchParams.term ?? searchParams.query ?? searchParams.q;
+
+  if (Array.isArray(rawTerm)) {
+    return rawTerm[0] ?? '';
+  }
+
+  return typeof rawTerm === 'string' ? rawTerm : '';
+};
+
+const createSearchSearchParamsLoader = cache(
+  async (searchFacets: Awaited<ReturnType<typeof fetchFacetedSearch>>['facets']['items']) => {
+    const transformedSearchFacets = await facetsTransformer({
+      refinedFacets: searchFacets,
+      allFacets: searchFacets,
+      searchParams: {},
+    });
+    const searchFilters = transformedSearchFacets.filter((facet) => facet != null);
+    const filterParsers = getFilterParsers(searchFilters);
+
+    // If there are no filters, return `null`, since calling `createLoader` with an empty
+    // object will throw the following cryptic error:
+    //
+    // ```
+    // Error: [nuqs] Empty search params cache. Search params can't be accessed in Layouts.
+    //   See https://err.47ng.com/NUQS-500
+    // ```
+    if (Object.keys(filterParsers).length === 0) {
+      return null;
+    }
+
+    return createLoader(filterParsers);
+  },
+);
+
+interface Props {
+  params: Promise<{ locale: string }>;
+  searchParams: Promise<SearchParams>;
+}
+
+export async function generateMetadata({ params }: Props): Promise<Metadata> {
+  const { locale } = await params;
+
+  const t = await getTranslations({ locale, namespace: 'Faceted.Search' });
 
   return {
     title: t('title'),
   };
 }
 
-interface Props {
-  searchParams: Promise<Record<string, string | string[] | undefined>>;
-}
-
 export default async function Search(props: Props) {
-  const searchParams = await props.searchParams;
-  const t = await getTranslations('Search');
+  const { locale } = await props.params;
 
-  const rawTerm = searchParams.term ?? searchParams.query ?? searchParams.q;
-  const searchTerm = typeof rawTerm === 'string' ? rawTerm : undefined;
+  setRequestLocale(locale);
 
-  if (!searchTerm) {
-    return (
-      <>
-        <h1 className="mb-3 text-4xl font-black lg:text-5xl">{t('heading')}</h1>
-        <SearchForm />
-      </>
+  const t = await getTranslations('Faceted');
+
+  const { settings } = await getSearchPageData();
+
+  const showRating = Boolean(settings?.reviews.enabled && settings.display.showProductRating);
+
+  const productComparisonsEnabled =
+    settings?.storefront.catalog?.productComparisonsEnabled ?? false;
+
+  const streamableFacetedSearch = Streamable.from(async () => {
+    const searchParams = await props.searchParams;
+    const customerAccessToken = await getSessionCustomerAccessToken();
+    const currencyCode = await getPreferredCurrencyCode();
+    const searchTerm = resolveSearchTerm(searchParams);
+
+    hawksearchDebug('search page request', {
+      searchParams,
+      searchTerm,
+      currencyCode,
+    });
+
+    const search = await fetchFacetedSearch(
+      searchParams,
+      currencyCode,
+      customerAccessToken,
     );
-  }
 
-  const search = await fetchFacetedSearch({ ...searchParams });
+    hawksearchDebug('search page response', {
+      totalItems: search.products.collectionInfo?.totalItems ?? 0,
+      itemCount: search.products.items.length,
+      facetCount: search.facets.items.length,
+    });
 
-  const productsCollection = search.products;
-  const products = productsCollection.items;
+    return search;
+  });
 
-  if (products.length === 0) {
-    return (
-      <div>
-        <SearchForm initialTerm={searchTerm} />
-      </div>
+  const streamableProducts = Streamable.from(async () => {
+    const format = await getFormatter();
+
+    const searchParams = await props.searchParams;
+    const searchTerm = resolveSearchTerm(searchParams);
+
+    if (!searchTerm) {
+      hawksearchDebug('search page products skipped (no term)', { searchParams });
+
+      return [];
+    }
+
+    const search = await streamableFacetedSearch;
+    const products = search.products.items;
+
+    const { defaultOutOfStockMessage, showOutOfStockMessage, showBackorderMessage } =
+      settings?.inventory ?? {};
+
+    return productCardTransformer(
+      products,
+      format,
+      showOutOfStockMessage ? defaultOutOfStockMessage : undefined,
+      showBackorderMessage,
     );
-  }
+  });
 
-  const { hasNextPage, hasPreviousPage, endCursor, startCursor } = productsCollection.pageInfo;
+  const streamableTitle = Streamable.from(async () => {
+    const searchParams = await props.searchParams;
+    const searchTerm = resolveSearchTerm(searchParams);
+
+    return `${t('Search.searchResults')} "${searchTerm}"`;
+  });
+
+  const streamableTotalCount = Streamable.from(async () => {
+    const format = await getFormatter();
+    const searchParams = await props.searchParams;
+    const searchTerm = resolveSearchTerm(searchParams);
+
+    if (!searchTerm) {
+      return format.number(0);
+    }
+
+    const search = await streamableFacetedSearch;
+
+    return format.number(search.products.collectionInfo?.totalItems ?? 0);
+  });
+
+  const streamableEmptyStateTitle = Streamable.from(async () => {
+    const searchParams = await props.searchParams;
+    const searchTerm = resolveSearchTerm(searchParams);
+
+    return t('Search.Empty.title', { term: searchTerm });
+  });
+
+  const streamablePagination = Streamable.from(async () => {
+    const searchParams = await props.searchParams;
+    const searchTerm = resolveSearchTerm(searchParams);
+
+    if (!searchTerm) {
+      hawksearchDebug('search page pagination skipped (no term)', { searchParams });
+
+      return {
+        startCursorParamName: 'before',
+        endCursorParamName: 'after',
+        endCursor: null,
+        startCursor: null,
+      };
+    }
+
+    const search = await streamableFacetedSearch;
+
+    return pageInfoTransformer(search.products.pageInfo);
+  });
+
+  const streamableFilters = Streamable.from(async () => {
+    const searchParams = await props.searchParams;
+    const searchTerm = resolveSearchTerm(searchParams);
+    const customerAccessToken = await getSessionCustomerAccessToken();
+    const refinedSearch = await streamableFacetedSearch;
+    const refinedFacets = refinedSearch.facets.items.filter(
+      (facet) => facet.__typename !== 'CategorySearchFilter',
+    );
+
+    if (!searchTerm) {
+      hawksearchDebug('search page filters skipped (no term)', { searchParams });
+
+      return [];
+    }
+
+    const loadSearchParams = await createSearchSearchParamsLoader(refinedSearch.facets.items);
+    const parsedSearchParams = loadSearchParams?.(searchParams) ?? {};
+
+    hawksearchDebug('search page parsed params', {
+      parsedSearchParams,
+    });
+
+    const requiresUnrefinedBaseline = Object.keys(parsedSearchParams).length > 0;
+    const allFacets = requiresUnrefinedBaseline
+      ? (await fetchFacetedSearch({}, undefined, customerAccessToken)).facets.items.filter(
+          (facet) => facet.__typename !== 'CategorySearchFilter',
+        )
+      : refinedFacets;
+
+    const transformedFacets = await facetsTransformer({
+      refinedFacets,
+      allFacets,
+      searchParams: { ...searchParams, ...parsedSearchParams },
+    });
+
+    return transformedFacets.filter((facet) => facet != null);
+  });
+
+  const streamableCompareProducts = Streamable.from(async () => {
+    const searchParams = await props.searchParams;
+    const customerAccessToken = await getSessionCustomerAccessToken();
+
+    if (!productComparisonsEnabled) {
+      return [];
+    }
+
+    const { compare } = compareLoader(searchParams);
+
+    const compareIds = { entityIds: compare ? compare.map((id: string) => Number(id)) : [] };
+
+    const products = await getCompareProductsData(compareIds, customerAccessToken);
+
+    return products.map((product) => ({
+      id: product.entityId.toString(),
+      title: product.name,
+      image: product.defaultImage
+        ? { src: product.defaultImage.url, alt: product.defaultImage.altText }
+        : undefined,
+      href: product.path,
+    }));
+  });
 
   return (
-    <div className="group">
-      <div className="md:mb-8 lg:flex lg:flex-row lg:items-center lg:justify-between">
-        <h1 className="mb-3 text-base">
-          {t('searchResults')} <br />
-          <b className="text-2xl font-bold lg:text-3xl">"{searchTerm}"</b>
-        </h1>
-
-        <div className="flex flex-col items-center gap-3 whitespace-nowrap md:flex-row">
-          <MobileSideNav>
-            <FacetedSearch
-              facets={search.facets.items}
-              headingId="mobile-filter-heading"
-              pageType="search"
-            />
-          </MobileSideNav>
-          <div className="flex w-full flex-col items-start gap-4 md:flex-row md:items-center md:justify-end md:gap-6">
-            <SortBy />
-            <div className="order-3 py-4 text-base font-semibold md:order-2 md:py-0">
-              {t('sortBy', { items: productsCollection.collectionInfo?.totalItems ?? 0 })}
-            </div>
-          </div>
-        </div>
-      </div>
-
-      <div className="grid grid-cols-4 gap-8">
-        <FacetedSearch
-          className="mb-8 hidden lg:block"
-          facets={search.facets.items}
-          headingId="desktop-filter-heading"
-          pageType="search"
-        />
-        <section
-          aria-labelledby="product-heading"
-          className="col-span-4 group-has-[[data-pending]]:animate-pulse lg:col-span-3"
-        >
-          <h2 className="sr-only" id="product-heading">
-            {t('products')}
-          </h2>
-
-          <div className="grid grid-cols-2 gap-6 sm:grid-cols-3 sm:gap-8">
-            {products.map((product, index) => (
-              <ProductCard
-                imagePriority={index <= 3}
-                imageSize="wide"
-                key={product.entityId}
-                product={product}
-              />
-            ))}
-          </div>
-
-          <Pagination
-            endCursor={endCursor ?? undefined}
-            hasNextPage={hasNextPage}
-            hasPreviousPage={hasPreviousPage}
-            startCursor={startCursor ?? undefined}
-          />
-        </section>
-      </div>
-    </div>
+    <ProductsListSection
+      breadcrumbs={[
+        { label: t('Search.Breadcrumbs.home'), href: '/' },
+        { label: t('Search.Breadcrumbs.search'), href: `#` },
+      ]}
+      compareLabel={t('Compare.compare')}
+      compareProducts={streamableCompareProducts}
+      emptyStateSubtitle={t('Search.Empty.subtitle')}
+      emptyStateTitle={streamableEmptyStateTitle}
+      filterLabel={t('FacetedSearch.filters')}
+      filters={streamableFilters}
+      filtersPanelTitle={t('FacetedSearch.filters')}
+      maxCompareLimitMessage={t('Compare.maxCompareLimit')}
+      maxItems={MAX_COMPARE_LIMIT}
+      paginationInfo={streamablePagination}
+      products={streamableProducts}
+      rangeFilterApplyLabel={t('FacetedSearch.Range.apply')}
+      removeLabel={t('Compare.remove')}
+      resetFiltersLabel={t('FacetedSearch.resetFilters')}
+      showCompare={productComparisonsEnabled}
+      showRating={showRating}
+      sortDefaultValue="featured"
+      sortLabel={t('SortBy.sortBy')}
+      sortOptions={[
+        { value: 'featured', label: t('SortBy.featuredItems') },
+        { value: 'newest', label: t('SortBy.newestItems') },
+        { value: 'best_selling', label: t('SortBy.bestSellingItems') },
+        { value: 'a_to_z', label: t('SortBy.aToZ') },
+        { value: 'z_to_a', label: t('SortBy.zToA') },
+        { value: 'best_reviewed', label: t('SortBy.byReview') },
+        { value: 'lowest_price', label: t('SortBy.priceAscending') },
+        { value: 'highest_price', label: t('SortBy.priceDescending') },
+        { value: 'relevance', label: t('SortBy.relevance') },
+      ]}
+      sortParamName="sort"
+      title={streamableTitle}
+      totalCount={streamableTotalCount}
+    />
   );
 }
