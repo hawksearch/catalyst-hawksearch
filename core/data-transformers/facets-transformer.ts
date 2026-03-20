@@ -187,7 +187,9 @@ export const facetsTransformer = async ({
     | Map<number, { productCount: number; subCategoryCounts: Map<number, number> }>
     | null = null;
 
-  if (selectedCategoryIds.size > 0) {
+  const shouldExpandCategoryTree = false;
+
+  if (shouldExpandCategoryTree && selectedCategoryIds.size > 0) {
     const categoryFacet = allFacets.find(
       (facet) => facet.__typename === 'CategorySearchFilter',
     );
