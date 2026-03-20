@@ -210,10 +210,11 @@ export default async function Search(props: Props) {
     });
 
     const requiresUnrefinedBaseline = Object.keys(parsedSearchParams).length > 0;
+    const baselineSearchParams = { term: searchTerm };
     const allFacets = requiresUnrefinedBaseline
-      ? (await fetchFacetedSearch({}, undefined, customerAccessToken)).facets.items.filter(
-          (facet) => facet.__typename !== 'CategorySearchFilter',
-        )
+      ? (
+          await fetchFacetedSearch(baselineSearchParams, undefined, customerAccessToken)
+        ).facets.items.filter((facet) => facet.__typename !== 'CategorySearchFilter')
       : refinedFacets;
 
     const transformedFacets = await facetsTransformer({
