@@ -10,7 +10,6 @@ import { useOptimistic, useState, useTransition } from 'react';
 
 import { Checkbox } from '@/vibes/soul/form/checkbox';
 import { RangeInput } from '@/vibes/soul/form/range-input';
-import { ToggleGroup } from '@/vibes/soul/form/toggle-group';
 import { Stream, Streamable, useStreamable } from '@/vibes/soul/lib/streamable';
 import { Accordion, AccordionItem } from '@/vibes/soul/primitives/accordion';
 import { Button } from '@/vibes/soul/primitives/button';
@@ -188,25 +187,35 @@ export function FiltersPanelInner({
                   title={`${filter.label}${getParamCountLabel(optimisticParams, filter.paramName)}`}
                   value={value}
                 >
-                  <ToggleGroup
-                    onValueChange={(toggleGroupValues) => {
-                      startTransition(async () => {
-                        const nextParams = {
-                          ...optimisticParams,
-                          [startCursorParamName]: null,
-                          [endCursorParamName]: null,
-                          [filter.paramName]:
-                            toggleGroupValues.length === 0 ? null : toggleGroupValues,
-                        };
+                  <div className="space-y-3">
+                    {filter.options.map((option) => (
+                      <Checkbox
+                        checked={optimisticParams[filter.paramName]?.includes(option.value) ?? false}
+                        disabled={option.disabled}
+                        key={option.value}
+                        label={option.label}
+                        onCheckedChange={(checked) =>
+                          startTransition(async () => {
+                            const selectedValues = new Set(optimisticParams[filter.paramName]);
 
-                        setOptimisticParams(nextParams);
-                        await setParams(nextParams);
-                      });
-                    }}
-                    options={filter.options}
-                    type="multiple"
-                    value={optimisticParams[filter.paramName] ?? []}
-                  />
+                            if (checked === true) selectedValues.add(option.value);
+                            else selectedValues.delete(option.value);
+
+                            const nextValues = Array.from(selectedValues);
+                            const nextParams = {
+                              ...optimisticParams,
+                              [startCursorParamName]: null,
+                              [endCursorParamName]: null,
+                              [filter.paramName]: nextValues.length === 0 ? null : nextValues,
+                            };
+
+                            setOptimisticParams(nextParams);
+                            await setParams(nextParams);
+                          })
+                        }
+                      />
+                    ))}
+                  </div>
                 </AccordionItem>
               );
 
