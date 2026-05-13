@@ -29,6 +29,8 @@ export interface HawksearchFacetValue {
 export interface HawksearchFacet {
   Name: string;
   DisplayName?: string;
+  Field?: string;
+  ParamName?: string;
   Values?: HawksearchFacetValue[];
 }
 
@@ -308,6 +310,8 @@ export const hawksearchRequest = async (
     const facetPreview = json.Facets.map((facet) => ({
       name: facet.Name,
       displayName: facet.DisplayName,
+      field: facet.Field,
+      paramName: facet.ParamName,
       values: (facet.Values ?? []).slice(0, 5).map((value) => ({
         value: value.Value,
         label: value.Label,

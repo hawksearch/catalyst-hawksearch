@@ -188,6 +188,41 @@ const normalizeFacetIdentifier = (value: string) =>
     .replace(/[^a-z0-9]+/g, '_')
     .replace(/^_+|_+$/g, '');
 
+const getFacetSelectionKey = (facet: HawksearchFacet) =>
+  normalizeFilterKey(facet.ParamName ?? facet.Field ?? facet.Name);
+
+const buildFacetSelectionAliasMap = (facets: Array<HawksearchFacet> = []) => {
+  const aliases = new Map<string, string>();
+
+  const addAlias = (alias: string | undefined, selectionKey: string) => {
+    if (!alias?.trim()) {
+      return;
+    }
+
+    const normalizedAlias = normalizeFacetIdentifier(alias);
+
+    if (normalizedAlias && !aliases.has(normalizedAlias)) {
+      aliases.set(normalizedAlias, selectionKey);
+    }
+  };
+
+  facets.forEach((facet) => {
+    const selectionKey = getFacetSelectionKey(facet);
+
+    addAlias(facet.Name, selectionKey);
+    addAlias(facet.DisplayName, selectionKey);
+    addAlias(facet.Field, selectionKey);
+    addAlias(facet.ParamName, selectionKey);
+  });
+
+  return aliases;
+};
+
+const resolveFacetSelectionKey = (
+  attribute: string,
+  facetSelectionAliases?: Map<string, string>,
+) => facetSelectionAliases?.get(normalizeFacetIdentifier(attribute)) ?? attribute;
+
 const toNumber = (value?: string) => {
   if (!value) {
     return undefined;
@@ -269,6 +304,7 @@ const resolveBrandEntityId = (
 const buildFacetSelections = (
   filters: HawksearchFilters,
   categoryFilterValues?: string[],
+  facetSelectionAliases?: Map<string, string>,
 ) => {
   const selections: Record<string, string[]> = {};
   const facetKeys = getFacetKeys();
@@ -331,7 +367,8 @@ const buildFacetSelections = (
   if (filters.productAttributes) {
     filters.productAttributes.forEach((attribute) => {
       if (attribute.values.length > 0) {
-        selections[attribute.attribute] = attribute.values;
+        selections[resolveFacetSelectionKey(attribute.attribute, facetSelectionAliases)] =
+          attribute.values;
       }
     });
   }
@@ -452,7 +489,10 @@ const mapFacet = (
   const normalizedKey = normalizeFilterKey(facet.Name);
   const values = toFacetValues(facet);
   const selectionValues =
-    selections[facet.Name] ?? selections[normalizedKey] ?? selections[normalizedName];
+    selections[getFacetSelectionKey(facet)] ??
+    selections[facet.Name] ??
+    selections[normalizedKey] ??
+    selections[normalizedName];
   const facetKeys = getFacetKeys();
   const normalizedCategoryFacetKey = normalizeFacetIdentifier(facetKeys.category);
   const normalizedBrandFacetKey = normalizeFacetIdentifier(facetKeys.brand);
@@ -571,27 +611,35 @@ export const facetedHawkSearch = async ({
   const pageNo = Number(after ?? before ?? 1);
   const keyword = typeof filters.searchTerm === 'string' ? filters.searchTerm.trim() : '';
   const categoryValueIndex = await getCategoryValueIndex();
+  const hasProductAttributeSelections =
+    filters.productAttributes?.some((attribute) => attribute.values.length > 0) ?? false;
+  let facetSelectionAliases: Map<string, string> | undefined;
 
-  // First, make an initial query to populate the entityId mapping if needed
-  // This is necessary when the map is empty (e.g., on first server-side render with user selections)
+  // First, make an initial query to populate selection metadata if needed.
+  // Category and brand filters need entityId mapping, while product attributes need
+  // Hawksearch Field/ParamName aliases for display-name based URLs.
   if (
     (filters.categoryEntityIds && filters.categoryEntityIds.length > 0) ||
-    filters.brandEntityIds && filters.brandEntityIds.length > 0
+    (filters.brandEntityIds && filters.brandEntityIds.length > 0) ||
+    hasProductAttributeSelections
   ) {
     const facetKeys = getFacetKeys();
     const needsCategoryMapping =
-      filters.categoryEntityIds &&
+      filters.categoryEntityIds != null &&
       filters.categoryEntityIds.some(
         (id) => !entityIdToValueMap.has(`${facetKeys.category}:${id}`),
       );
     const needsBrandMapping =
-      filters.brandEntityIds &&
+      filters.brandEntityIds != null &&
       filters.brandEntityIds.some((id) => !entityIdToValueMap.has(`${facetKeys.brand}:${id}`));
+    const needsInitialFacetQuery =
+      needsCategoryMapping || needsBrandMapping || hasProductAttributeSelections;
 
-    if (needsCategoryMapping || needsBrandMapping) {
-      hawksearchDebug('entityIdToValueMap needs population, making initial query', {
+    if (needsInitialFacetQuery) {
+      hawksearchDebug('facet metadata needs population, making initial query', {
         needsCategoryMapping,
         needsBrandMapping,
+        hasProductAttributeSelections,
         mapSize: entityIdToValueMap.size,
       });
 
@@ -613,6 +661,14 @@ export const facetedHawkSearch = async ({
         });
 
       const initialResponse = await runHawksearchSearch(initialPayload, initialFallback);
+
+      if (hasProductAttributeSelections) {
+        facetSelectionAliases = buildFacetSelectionAliasMap(initialResponse.Facets);
+
+        hawksearchDebug('facet selection aliases populated', {
+          aliases: Array.from(facetSelectionAliases.entries()),
+        });
+      }
 
       // Process facets to populate the map
       initialResponse.Facets?.forEach((facet) => {
@@ -641,7 +697,11 @@ export const facetedHawkSearch = async ({
     }
   }
 
-  const selections = buildFacetSelections(filters, categoryFilterValues);
+  const selections = buildFacetSelections(
+    filters,
+    categoryFilterValues,
+    facetSelectionAliases,
+  );
 
   hawksearchDebug('faceted search request', {
     limit,
